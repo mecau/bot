@@ -505,20 +505,26 @@ async def handle_text(message: Message):
         await status_msg.edit_text(f"✅ Рассылка завершена!\n\n👥 Доставлено: {success}\n❌ Ошибок: {failed}")
         return
 
-    if user_id in ppt_states:
+        if user_id in ppt_states:
         ppt_states.remove(user_id)
-        status_msg = await message.answer("📈 Генерирую презентацию и иллюстрации, подожди немного...")
+        status_msg = await message.answer("📈 Генерирую развернутую презентацию и оформление, подожди немного...")
         try:
             await bot.send_chat_action(chat_id=message.chat.id, action="typing")
             user_images = user_ppt_images.pop(user_id, [])
-            num_slides = max(len(user_images), 5) if user_images else 5
+            num_slides = max(len(user_images), 5) if user_images else 6
 
             response = await groq_client.chat.completions.create(
                 model=TEXT_MODEL,
                 messages=[
                     {
                         "role": "system",
-                        "content": f"Составь презентацию ровно из {num_slides} слайдов. Ответ выдай СТРОГО в формате валидного JSON без markdown-оформления (без ```json), в виде списка объектов: [{{\"title\": \"Заголовок слайда\", \"points\": [\"Тезис 1\", \"Тезис 2\"], \"image_prompt\": \"Detailed professional visual illustration of the slide topic in English\"}}]. В поле image_prompt ВСЕГДА пиши качественный промпт на английском языке для генерации картинки."
+                        "content": (
+                            f"Составь подробную, качественную учебную презентацию ровно из {num_slides} слайдов на заданную тему. "
+                            "Для каждого слайда пиши развернутые, информативные тезисы (по 3-4 полноценных предложения или емких пункта, несущих реальный смысл, а не просто заголовки). "
+                            "Ответ выдай СТРОГО в формате валидного JSON без markdown-оформления (без ```json), в виде списка объектов: "
+                            "[{{\"title\": \"Заголовок слайда\", \"points\": [\"Развернутый тезис с объяснением сути 1\", \"Развернутый тезис 2\"], \"image_prompt\": \"Detailed professional visual illustration of the slide topic in English\"}}]. "
+                            "В поле image_prompt ВСЕГДА пиши качественный промпт на английском языке для генерации картинки."
+                        )
                     },
                     {"role": "user", "content": f"Тема: {message.text}"}
                 ],
@@ -537,16 +543,60 @@ async def handle_text(message: Message):
             prs.slide_width = PptxInches(13.333)
             prs.slide_height = PptxInches(7.5)
 
-            slide = prs.slides.add_slide(prs.slide_layouts[0])
-            slide.shapes.title.text = "Презентация проекта"
-            slide.placeholders[1].text = message.text
+            # Импортируем цвета и фигуры для оформления внутри блока
+            from pptx.dml.color import RGBColor
+            from pptx.enum.shapes import MSO_SHAPE
+
+            # Титульный слайд с оформлением
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            
+            # Фоновая плашка на титульник
+            bg_shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+            bg_shape.fill.solid()
+            bg_shape.fill.fore_color.rgb = RGBColor(24, 43, 73)  # Глубокий темно-синий
+            bg_shape.line.color.rgb = RGBColor(24, 43, 73)
+
+            # Текст титульника
+            title_box = slide.shapes.add_textbox(PptxInches(1.0), PptxInches(2.2), PptxInches(11.333), PptxInches(3.0))
+            tf_title = title_box.text_frame
+            tf_title.word_wrap = True
+            
+            p_main = tf_title.paragraphs[0]
+            p_main.text = message.text
+            p_main.font.name = 'Times New Roman'
+            p_main.font.size = PptxPt(36)
+            p_main.font.bold = True
+            p_main.font.color.rgb = RGBColor(255, 255, 255)
+            p_main.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            p_sub = tf_title.add_paragraph()
+            p_sub.text = "Презентация подготовлена с помощью MecauAI"
+            p_sub.font.name = 'Times New Roman'
+            p_sub.font.size = PptxPt(18)
+            p_sub.font.color.rgb = RGBColor(200, 215, 235)
+            p_sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
             async with aiohttp.ClientSession() as session:
                 for idx, item in enumerate(slides_data):
                     s = prs.slides.add_slide(prs.slide_layouts[6])
-                    tb_title = s.shapes.add_textbox(PptxInches(0.8), PptxInches(0.6), PptxInches(11.7), PptxInches(1.0))
-                    tb_title.text_frame.text = item.get("title", f"Слайд {idx+1}")
                     
+                    # Заголовок слайда
+                    tb_title = s.shapes.add_textbox(PptxInches(0.8), PptxInches(0.5), PptxInches(11.7), PptxInches(0.9))
+                    tf_t = tb_title.text_frame
+                    tf_t.word_wrap = True
+                    p_t = tf_t.paragraphs[0]
+                    p_t.text = item.get("title", f"Слайд {idx+1}")
+                    p_t.font.name = 'Times New Roman'
+                    p_t.font.size = PptxPt(28)
+                    p_t.font.bold = True
+                    p_t.font.color.rgb = RGBColor(24, 43, 73)
+
+                    # Акцентная линия под заголовком
+                    line = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, PptxInches(0.8), PptxInches(1.4), PptxInches(2.5), PptxInches(0.05))
+                    line.fill.solid()
+                    line.fill.fore_color.rgb = RGBColor(79, 129, 189)
+                    line.line.color.rgb = RGBColor(79, 129, 189)
+
                     img_stream = None
                     if user_images and idx < len(user_images):
                         img_stream = io.BytesIO(user_images[idx])
@@ -563,28 +613,36 @@ async def handle_text(message: Message):
                             logging.error(f"Не удалось сгенерировать картинку для слайда {idx}: {gen_err}")
 
                     has_img = img_stream is not None
-                    tb_content = s.shapes.add_textbox(PptxInches(0.8), PptxInches(1.8), PptxInches(6.8) if has_img else PptxInches(11.7), PptxInches(5.0))
+                    
+                    # Текстовый блок для тезисов (шире, если нет картинки)
+                    content_width = PptxInches(7.2) if has_img else PptxInches(11.7)
+                    tb_content = s.shapes.add_textbox(PptxInches(0.8), PptxInches(1.7), content_width, PptxInches(5.2))
                     tf = tb_content.text_frame
                     tf.word_wrap = True
-                    for pt in item.get("points", []):
-                        p = tf.add_paragraph() if tf.text else tf.paragraphs[0]
-                        p.text = "• " + pt
+                    
+                    points = item.get("points", [])
+                    for p_idx, pt in enumerate(points):
+                        p = tf.add_paragraph() if p_idx > 0 else tf.paragraphs[0]
+                        p.text = "▪  " + pt
                         p.font.name = 'Times New Roman'
-                        p.font.size = PptxPt(18)
+                        p.font.size = PptxPt(16)
+                        p.font.color.rgb = RGBColor(50, 50, 50)
+                        p.space_after = PptxPt(14)  # Отступ между абзацами для читаемости
 
+                    # Вставка картинки, если она есть
                     if has_img and img_stream:
                         try:
-                            s.shapes.add_picture(img_stream, left=PptxInches(8.0), top=PptxInches(1.8), width=PptxInches(4.5))
+                            s.shapes.add_picture(img_stream, left=PptxInches(8.3), top=PptxInches(1.7), width=PptxInches(4.2))
                         except Exception as img_err:
                             logging.error(f"Не удалось вставить картинку на слайд {idx}: {img_err}")
 
             bio = io.BytesIO()
             prs.save(bio)
             bio.seek(0)
-            file_doc = BufferedInputFile(bio.read(), filename="Presentation.pptx")
+            file_doc = BufferedInputFile(bio.read(), filename="Presentation_Styled.pptx")
             
             await status_msg.delete()
-            await message.answer_document(file_doc, caption="📈 Презентация с картинками готова!")
+            await message.answer_document(file_doc, caption="📈 Развернутая и оформленная презентация готова!")
             
         except Exception as e:
             logging.error(f"Критическая ошибка при генерации презентации: {e}", exc_info=True)
@@ -594,6 +652,7 @@ async def handle_text(message: Message):
                 pass
             await message.answer("⚠️ Произошла ошибка при создании презентации. Попробуй еще раз.")
         return
+
 
     if user_id in excel_states:
         excel_states.remove(user_id)
