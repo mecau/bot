@@ -11,7 +11,8 @@ CHANNEL_2_URL = "https://t.me/mecauinfo"
 
 
 TEXT_MODEL = "llama-3.3-70b-versatile"
-VISION_MODEL = "llama-3.2-11b-vision-preview"
+VISION_MODEL = "qwen/qwen3.6-27b"
+
 
 AD_FOOTER = "\n\n—\n⚡ Нужна учебная работа под заказ? пиши @mecau"
 
