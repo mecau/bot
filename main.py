@@ -458,7 +458,6 @@ async def handle_photo(message: Message):
     downloaded_file = await bot.download_file(file_info.file_path)
     img_bytes = downloaded_file.read()
 
-    # Если пользователь сейчас создает презентацию, сохраняем картинку для слайдов
     if user_id in ppt_states:
         if user_id not in user_ppt_images:
             user_ppt_images[user_id] = []
@@ -466,7 +465,6 @@ async def handle_photo(message: Message):
         await message.answer(f"🖼 Картинка сохранена для презентации ({len(user_ppt_images[user_id])} шт.)! Теперь отправь тему презентации.")
         return
 
-    # Обычный режим анализа картинки через Vision ИИ
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
         base64_image = base64.b64encode(img_bytes).decode('utf-8')
@@ -499,7 +497,7 @@ async def handle_text(message: Message):
         status_msg = await message.answer("📢 Начинаю рассылку...")
         for uid in users:
             try:
-    await bot.send_message(uid, message.text, disable_web_page_preview=True)
+                await bot.send_message(uid, message.text, disable_web_page_preview=True)
                 success += 1
                 await asyncio.sleep(0.05)
             except Exception:
