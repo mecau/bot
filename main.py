@@ -182,7 +182,7 @@ async def cmd_start(message: Message):
 
     start_text = (
         f"Привет, {message.from_user.first_name}! Ты активировал MecauAI 🚀\n\n"
-        "Я твой карманный помощник для учебы и разработки. Отправляй любые вопросы, задачи, код или создавай презентации!"
+        "Я твой карманный помощник для учебы и разработки. Отправляй любые вопросы, задачи, картинки, код или создавай презентации с таблицами!"
     )
     await message.answer(start_text, reply_markup=keyboard_for(user_id))
 
@@ -214,7 +214,7 @@ async def cmd_about(message: Message):
         "• 🧠 Академический ассистент и Лучший друг.\n"
         "• 📄 Экспорт в .docx и Титульники по ГОСТу.\n"
         "• 📈 Генерация презентаций (.pptx) с твоими или ИИ-картинками.\n"
-        "• 📊 Таблицы Excel (.xlsx) и Избранное."
+        "• 📊 Автоматические таблицы Excel (.xlsx) и Избранное."
     )
     await message.answer(about_text, reply_markup=keyboard_for(message.from_user.id))
 
@@ -266,6 +266,7 @@ async def cmd_ppt_prompt(message: Message):
         await message.answer(f"🔒 Сначала подпишись на каналы:\n1️⃣ {CHANNEL_1_URL}\n2️⃣ {CHANNEL_2_URL}", reply_markup=get_sub_keyboard())
         return
     ppt_states.add(user_id)
+    excel_states.discard(user_id)
     user_ppt_images.pop(user_id, None)
     await message.answer(
         "📈 Отправь тему презентации следующим сообщением.\n\n"
@@ -280,7 +281,8 @@ async def cmd_excel_prompt(message: Message):
         await message.answer(f"🔒 Сначала подпишись на каналы:\n1️⃣ {CHANNEL_1_URL}\n2️⃣ {CHANNEL_2_URL}", reply_markup=get_sub_keyboard())
         return
     excel_states.add(user_id)
-    await message.answer("📊 Опиши задачу или тему для таблицы следующим сообщением, и я сформирую аккуратный Excel-файл (.xlsx)!")
+    ppt_states.discard(user_id)
+    await message.answer("📊 Опиши задачу или тему для таблицы следующим сообщением (например: *«Таблица успеваемости студентов с оценками»*), и я сформирую готовый Excel-файл (.xlsx)!", parse_mode="Markdown")
 
 @dp.message(F.text == "⭐ Избранное")
 async def cmd_favorites(message: Message):
@@ -456,14 +458,16 @@ async def handle_photo(message: Message):
     downloaded_file = await bot.download_file(file_info.file_path)
     img_bytes = downloaded_file.read()
 
-    if user_id not in user_ppt_images:
-        user_ppt_images[user_id] = []
-    user_ppt_images[user_id].append(img_bytes)
-
+    # Если пользователь сейчас создает презентацию, сохраняем картинку для слайдов
     if user_id in ppt_states:
-        await message.answer(f"🖼 Картинка сохранена ({len(user_ppt_images[user_id])} шт.)! Теперь отправь тему презентации.")
+        if user_id not in user_ppt_images:
+            user_ppt_images[user_id] = []
+        user_ppt_images[user_id].append(img_bytes)
+        await message.answer(f"🖼 Картинка сохранена для презентации ({len(user_ppt_images[user_id])} шт.)! Теперь отправь тему презентации.")
         return
 
+    # Обычный режим анализа картинки через Vision ИИ
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
         base64_image = base64.b64encode(img_bytes).decode('utf-8')
         response = await groq_client.chat.completions.create(
@@ -471,7 +475,7 @@ async def handle_photo(message: Message):
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": message.caption or "Проанализируй изображение."},
+                    {"type": "text", "text": message.caption or "Подробно проанализируй это изображение, распознай текст если он есть и ответь по сути."},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ]
             }]
@@ -480,7 +484,8 @@ async def handle_photo(message: Message):
         user_data = get_user_data(user_id)
         user_data["last_output"] = reply
         await message.answer(f"{reply}{AD_FOOTER}", parse_mode="HTML", reply_markup=get_answer_inline_keyboard(), disable_web_page_preview=True)
-    except Exception:
+    except Exception as e:
+        logging.error(f"Ошибка обработки фото: {e}")
         await message.answer("⚠️ Ошибка при обработке изображения. Попробуй ещё раз. Если повторится, пиши - @mecau")
 
 @dp.message(F.text)
@@ -494,7 +499,7 @@ async def handle_text(message: Message):
         status_msg = await message.answer("📢 Начинаю рассылку...")
         for uid in users:
             try:
-                await bot.send_message(uid, message.text, disable_web_page_preview=True)
+    await bot.send_message(uid, message.text, disable_web_page_preview=True)
                 success += 1
                 await asyncio.sleep(0.05)
             except Exception:
@@ -589,12 +594,91 @@ async def handle_text(message: Message):
                 await status_msg.delete()
             except Exception:
                 pass
-            await message.answer(f"⚠️ Произошла ошибка при создании презентации. Попробуй еще раз.")
+            await message.answer("⚠️ Произошла ошибка при создании презентации. Попробуй еще раз.")
         return
 
     if user_id in excel_states:
         excel_states.remove(user_id)
-        await message.answer("📊 Функционал Excel в работе...")
+        status_msg = await message.answer("📊 Генерирую таблицу Excel, подожди секунду...")
+        try:
+            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+            response = await groq_client.chat.completions.create(
+                model=TEXT_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Создай структуру таблицы на основе запроса пользователя. Ответ выдай СТРОГО в формате валидного JSON без markdown-оформления (без ```json), в виде объекта с ключом 'headers' (список строк-заголовков) и ключом 'rows' (список списков с данными для строк таблицы). Пример: {\"headers\": [\"№\", \"Название\", \"Значение\"], \"rows\": [[1, \"Пример 1\", 100], [2, \"Пример 2\", 200]]}"
+                    },
+                    {"role": "user", "content": f"Задача для таблицы: {message.text}"}
+                ],
+                temperature=0.7
+            )
+            raw_content = clean_text_for_html(response.choices[0].message.content)
+            if "```json" in raw_content:
+                raw_content = raw_content.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw_content:
+                raw_content = raw_content.split("```")[1].split("```")[0].strip()
+            
+            table_data = json.loads(raw_content)
+            headers = table_data.get("headers", ["Колонка 1", "Колонка 2"])
+            rows = table_data.get("rows", [["Данные 1", "Данные 2"]])
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Таблица"
+
+            header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+            header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+            align_center = Alignment(horizontal="center", vertical="center")
+            align_left = Alignment(horizontal="left", vertical="center")
+            border_thin = Border(
+                left=Side(style='thin', color='D9D9D9'),
+                right=Side(style='thin', color='D9D9D9'),
+                top=Side(style='thin', color='D9D9D9'),
+                bottom=Side(style='thin', color='D9D9D9')
+            )
+
+            ws.append(headers)
+            for col_num in range(1, len(headers) + 1):
+                cell = ws.cell(row=1, column=col_num)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = align_center
+                cell.border = border_thin
+
+            for row_idx, row_data in enumerate(rows, start=2):
+                ws.append(row_data)
+                for col_num in range(1, len(row_data) + 1):
+                    cell = ws.cell(row=row_idx, column=col_num)
+                    cell.font = Font(name="Calibri", size=11)
+                    cell.alignment = align_left
+                    cell.border = border_thin
+
+            for col in ws.columns:
+                max_length = 0
+                column_letter = col[0].column_letter
+                for cell in col:
+                    try:
+                        if cell.value:
+                            max_length = max(max_length, len(str(cell.value)))
+                    except Exception:
+                        pass
+                ws.column_dimensions[column_letter].width = max(max_length + 4, 12)
+
+            bio = io.BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            file_doc = BufferedInputFile(bio.read(), filename="MecauAI_Table.xlsx")
+            
+            await status_msg.delete()
+            await message.answer_document(file_doc, caption="📊 Твоя таблица Excel (.xlsx) готова!")
+        except Exception as e:
+            logging.error(f"Ошибка при создании Excel: {e}", exc_info=True)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            await message.answer("⚠️ Произошла ошибка при создании таблицы Excel. Попробуй еще раз.")
         return
 
     if message.text in MENU_BUTTONS:
@@ -651,4 +735,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-          
