@@ -213,7 +213,7 @@ async def cmd_about(message: Message):
         "• 💻 Режим «ИИ-Программист»: Написание чистого кода с копированием в 1 клик.\n"
         "• 🧠 Академический ассистент и Лучший друг.\n"
         "• 📄 Экспорт в .docx и Титульники по ГОСТу.\n"
-        "• 📈 Генерация презентаций (.pptx) с твоими или ИИ-картинками.\n"
+        "• 📈 Генерация презентаций (.pptx) с твоими картинками.\n"
         "• 📊 Автоматические таблицы Excel (.xlsx) и Избранное."
     )
     await message.answer(about_text, reply_markup=keyboard_for(message.from_user.id))
@@ -634,6 +634,146 @@ async def handle_text(message: Message):
                         try:
                             s.shapes.add_picture(img_stream, left=PptxInches(8.3), top=PptxInches(1.7), width=PptxInches(4.2))
                         except Exception as img_err:
+@dp.message(F.text)
+async def handle_text(message: Message):
+    user_id = message.from_user.id
+
+    if user_id == MY_ADMIN_ID and user_id in broadcast_states:
+        broadcast_states.remove(user_id)
+        users = load_user_ids()
+        success, failed = 0, 0
+        status_msg = await message.answer("📢 Начинаю рассылку...")
+        for uid in users:
+            try:
+                await bot.send_message(uid, message.text, disable_web_page_preview=True)
+                success += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
+        await status_msg.edit_text(f"✅ Рассылка завершена!\n\n👥 Доставлено: {success}\n❌ Ошибок: {failed}")
+        return
+
+    if user_id in ppt_states:
+        ppt_states.remove(user_id)
+        status_msg = await message.answer("📈 Генерирую развернутую презентацию и оформление, подожди немного...")
+        try:
+            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+            user_images = user_ppt_images.pop(user_id, [])
+            num_slides = max(len(user_images), 5) if user_images else 6
+
+            response = await groq_client.chat.completions.create(
+                model=TEXT_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Составь подробную, качественную учебную презентацию ровно из {num_slides} слайдов на заданную тему. "
+                            "Для каждого слайда пиши развернутые, информативные тезисы (по 3-4 полноценных предложения или емких пункта, несущих реальный смысл, а не просто заголовки). "
+                            "Ответ выдай СТРОГО в формате валидного JSON без markdown-оформления (без ```json), в виде списка объектов: "
+                            "[{\"title\": \"Заголовок слайда\", \"points\": [\"Развернутый тезис с объяснением сути 1\", \"Развернутый тезис 2\"], \"image_prompt\": \"Detailed professional visual illustration of the slide topic in English\"}]. "
+                            "В поле image_prompt ВСЕГДА пиши качественный промпт на английском языке для генерации картинки."
+                        )
+                    },
+                    {"role": "user", "content": f"Тема: {message.text}"}
+                ],
+                temperature=0.7
+            )
+            raw_content = clean_text_for_html(response.choices[0].message.content)
+            
+            if "```json" in raw_content:
+                raw_content = raw_content.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw_content:
+                raw_content = raw_content.split("```")[1].split("```")[0].strip()
+            
+            slides_data = json.loads(raw_content)
+            
+            prs = Presentation()
+            prs.slide_width = PptxInches(13.333)
+            prs.slide_height = PptxInches(7.5)
+
+            from pptx.dml.color import RGBColor
+            from pptx.enum.shapes import MSO_SHAPE
+
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            
+            bg_shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+            bg_shape.fill.solid()
+            bg_shape.fill.fore_color.rgb = RGBColor(24, 43, 73)
+            bg_shape.line.color.rgb = RGBColor(24, 43, 73)
+
+            title_box = slide.shapes.add_textbox(PptxInches(1.0), PptxInches(2.2), PptxInches(11.333), PptxInches(3.0))
+            tf_title = title_box.text_frame
+            tf_title.word_wrap = True
+            
+            p_main = tf_title.paragraphs[0]
+            p_main.text = message.text
+            p_main.font.name = 'Times New Roman'
+            p_main.font.size = PptxPt(36)
+            p_main.font.bold = True
+            p_main.font.color.rgb = RGBColor(255, 255, 255)
+            p_main.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            p_sub = tf_title.add_paragraph()
+            p_sub.text = "Презентация подготовлена с помощью MecauAI"
+            p_sub.font.name = 'Times New Roman'
+            p_sub.font.size = PptxPt(18)
+            p_sub.font.color.rgb = RGBColor(200, 215, 235)
+            p_sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            async with aiohttp.ClientSession() as session:
+                for idx, item in enumerate(slides_data):
+                    s = prs.slides.add_slide(prs.slide_layouts[6])
+                    
+                    tb_title = s.shapes.add_textbox(PptxInches(0.8), PptxInches(0.5), PptxInches(11.7), PptxInches(0.9))
+                    tf_t = tb_title.text_frame
+                    tf_t.word_wrap = True
+                    p_t = tf_t.paragraphs[0]
+                    p_t.text = item.get("title", f"Слайд {idx+1}")
+                    p_t.font.name = 'Times New Roman'
+                    p_t.font.size = PptxPt(28)
+                    p_t.font.bold = True
+                    p_t.font.color.rgb = RGBColor(24, 43, 73)
+
+                    line = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, PptxInches(0.8), PptxInches(1.4), PptxInches(2.5), PptxInches(0.05))
+                    line.fill.solid()
+                    line.fill.fore_color.rgb = RGBColor(79, 129, 189)
+                    line.line.color.rgb = RGBColor(79, 129, 189)
+
+                    img_stream = None
+                    if user_images and idx < len(user_images):
+                        img_stream = io.BytesIO(user_images[idx])
+                    elif "image_prompt" in item and item["image_prompt"]:
+                        try:
+                            img_prompt = urllib.parse.quote(item["image_prompt"])
+                            img_url = f"[https://gen.pollinations.ai/image/](https://gen.pollinations.ai/image/){img_prompt}?width=800&height=600&nologo=true&model=flux"
+                            async with session.get(img_url, timeout=15) as resp:
+                                if resp.status == 200:
+                                    img_bytes = await resp.read()
+                                    if len(img_bytes) > 1000:
+                                        img_stream = io.BytesIO(img_bytes)
+                        except Exception as gen_err:
+                            logging.error(f"Не удалось сгенерировать картинку для слайда {idx}: {gen_err}")
+
+                    has_img = img_stream is not None
+                    
+                    content_width = PptxInches(7.2) if has_img else PptxInches(11.7)
+                    tb_content = s.shapes.add_textbox(PptxInches(0.8), PptxInches(1.7), content_width, PptxInches(5.2))
+                    tf = tb_content.text_frame
+                    tf.word_wrap = True
+                    
+                    points = item.get("points", [])
+                    for p_idx, pt in enumerate(points):
+                        p = tf.add_paragraph() if p_idx > 0 else tf.paragraphs[0]
+                        p.text = "▪  " + pt
+                        p.font.name = 'Times New Roman'
+                        p.font.size = PptxPt(16)
+                        p.font.color.rgb = RGBColor(50, 50, 50)
+                        p.space_after = PptxPt(14)
+
+                    if has_img and img_stream:
+                        try:
+                            s.shapes.add_picture(img_stream, left=PptxInches(8.3), top=PptxInches(1.7), width=PptxInches(4.2))
+                        except Exception as img_err:
                             logging.error(f"Не удалось вставить картинку на слайд {idx}: {img_err}")
 
             bio = io.BytesIO()
@@ -652,6 +792,133 @@ async def handle_text(message: Message):
                 pass
             await message.answer("⚠️ Произошла ошибка при создании презентации. Попробуй еще раз.")
         return
+
+    if user_id in excel_states:
+        excel_states.remove(user_id)
+        status_msg = await message.answer("📊 Генерирую таблицу Excel, подожди секунду...")
+        try:
+            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+            response = await groq_client.chat.completions.create(
+                model=TEXT_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Создай структуру таблицы на основе запроса пользователя. Ответ выдай СТРОГО в формате валидного JSON без markdown-оформления (без ```json), в виде объекта с ключом 'headers' (список строк-заголовков) и ключом 'rows' (список списков с данными для строк таблицы). Пример: {\"headers\": [\"№\", \"Название\", \"Значение\"], \"rows\": [[1, \"Пример 1\", 100], [2, \"Пример 2\", 200]]}"
+                    },
+                    {"role": "user", "content": f"Задача для таблицы: {message.text}"}
+                ],
+                temperature=0.7
+            )
+            raw_content = clean_text_for_html(response.choices[0].message.content)
+            if "```json" in raw_content:
+                raw_content = raw_content.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw_content:
+                raw_content = raw_content.split("```")[1].split("```")[0].strip()
+            
+            table_data = json.loads(raw_content)
+            headers = table_data.get("headers", ["Колонка 1", "Колонка 2"])
+            rows = table_data.get("rows", [["Данные 1", "Данные 2"]])
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Таблица"
+
+            header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+            header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+            align_center = Alignment(horizontal="center", vertical="center")
+            align_left = Alignment(horizontal="left", vertical="center")
+            border_thin = Border(
+                left=Side(style='thin', color='D9D9D9'),
+                right=Side(style='thin', color='D9D9D9'),
+                top=Side(style='thin', color='D9D9D9'),
+                bottom=Side(style='thin', color='D9D9D9')
+            )
+
+            ws.append(headers)
+            for col_num in range(1, len(headers) + 1):
+                cell = ws.cell(row=1, column=col_num)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = align_center
+                cell.border = border_thin
+
+            for row_idx, row_data in enumerate(rows, start=2):
+                ws.append(row_data)
+                for col_num in range(1, len(row_data) + 1):
+                    cell = ws.cell(row=row_idx, column=col_num)
+                    cell.font = Font(name="Calibri", size=11)
+                    cell.alignment = align_left
+                    cell.border = border_thin
+
+            for col in ws.columns:
+                max_length = 0
+                column_letter = col[0].column_letter
+                for cell in col:
+                    try:
+                        if cell.value:
+                            max_length = max(max_length, len(str(cell.value)))
+                    except Exception:
+                        pass
+                ws.column_dimensions[column_letter].width = max(max_length + 4, 12)
+
+            bio = io.BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            file_doc = BufferedInputFile(bio.read(), filename="MecauAI_Table.xlsx")
+            
+            await status_msg.delete()
+            await message.answer_document(file_doc, caption="📊 Твоя таблица Excel (.xlsx) готова!")
+        except Exception as e:
+            logging.error(f"Ошибка при создании Excel: {e}", exc_info=True)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            await message.answer("⚠️ Произошла ошибка при создании таблицы Excel. Попробуй еще раз.")
+        return
+
+    if message.text in MENU_BUTTONS:
+        return
+
+    if not await check_subscription(user_id):
+        await message.answer(f"🔒 Сначала подпишись на каналы:\n1️⃣ {CHANNEL_1_URL}\n2️⃣ {CHANNEL_2_URL}", reply_markup=get_sub_keyboard())
+        return
+
+    save_user_id(user_id)
+    user_data = get_user_data(user_id)
+    current_mode = user_data["mode"]
+
+    system_prompt = PROMPTS.get(current_mode, PROMPTS["ai"])
+
+    user_data["history"].append({"role": "user", "content": message.text})
+    if len(user_data["history"]) > 6:
+        user_data["history"] = user_data["history"][-6:]
+
+    messages_payload = [{"role": "system", "content": system_prompt}] + user_data["history"]
+
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try:
+        response = await groq_client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=messages_payload,
+            temperature=0.7
+        )
+        ai_reply = clean_text_for_html(response.choices[0].message.content)
+        if not ai_reply:
+            ai_reply = "Готово."
+
+        user_data["history"].append({"role": "assistant", "content": ai_reply})
+        user_data["last_output"] = ai_reply
+
+        if current_mode == "coder":
+            full_message = f"{ai_reply}\n\n{AD_FOOTER}"
+            await message.answer(full_message, parse_mode="Markdown", reply_markup=get_answer_inline_keyboard(), disable_web_page_preview=True)
+        else:
+            full_message = f"{ai_reply}{AD_FOOTER}"
+            await message.answer(full_message, parse_mode="HTML", reply_markup=get_answer_inline_keyboard(), disable_web_page_preview=True)
+    except Exception:
+        await message.answer("⚠️ Ошибка при обработке запроса. Попробуй ещё раз. Если повторится, пиши - @mecau")
+
 
 
     if user_id in excel_states:
