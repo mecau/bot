@@ -1063,8 +1063,7 @@ async def cmd_support(message: Message):
         return
     await message.answer(
         "🛠 <b>Техподдержка MecauAI</b>\n\n"
-        "Если бот работает неправильно, нашёл ошибку или есть вопрос — напиши в поддержку.\n\n"
-        "👤 Поддержка: <b>@mecau</b>",
+        "Если бот работает неправильно, нашёл ошибку или есть вопрос — напиши в поддержку.\n\n",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 Написать в поддержку", url="https://t.me/mecau")]
