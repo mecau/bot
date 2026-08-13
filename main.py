@@ -1248,8 +1248,7 @@ async def cmd_support(message: Message):
         return
     await message.answer(
         "🛠 <b>Техподдержка MecauAI</b>\n\n"
-        "Если бот работает неправильно, нашёл ошибку или есть вопрос — напиши в поддержку.\n\n"
-        "👤 Поддержка: <b>@mecau</b>",
+        "Если бот работает неправильно, нашёл ошибку или есть вопрос — напиши в поддержку.\n\n",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 Написать в поддержку", url="https://t.me/mecau")]
@@ -1607,7 +1606,7 @@ async def cb_ppt_count(callback: types.CallbackQuery):
     if topic:
         await callback.message.answer(f"📌 <b>Шаг 3/3 — тема уже получена:</b> «{topic[:300]}»\n\nОтправь свои картинки сейчас или нажми «Готово», чтобы начать.",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Начать генерацию",callback_data="ppt_start")],[InlineKeyboardButton(text="❌ Отмена",callback_data="cancel_flow")]]))
     else:
-        await callback.message.answer("📌 <b>Шаг 3/3 — отправь тему презентации.</b>\n\nПосле темы можно отправить свои изображения. Когда закончишь — напиши <b>«готово»</b>.",parse_mode="HTML")
+        await callback.message.answer("📌 <b>Шаг 3/3 — отправь тему презентации.</b>\n\nПосле темы можно отправить свои изображения.",parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "ppt_wait_images")
