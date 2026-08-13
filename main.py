@@ -17,7 +17,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, Message, BotCommand, BufferedInputFile
+    ReplyKeyboardMarkup, KeyboardButton, Message, BotCommand, BufferedInputFile, CallbackQuery
 )
 from openai import AsyncOpenAI
 from docx import Document
