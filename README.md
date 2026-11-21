@@ -6,7 +6,7 @@ Telegram-бот на Python: ИИ-диалоги через Groq, голосов
 
 - Python 3.10 или новее (CI проверяет Python 3.10, 3.11 и 3.12).
 - Токен Telegram-бота от BotFather.
-- API-ключ Groq.
+- API-ключ хотя бы одного провайдера: Groq, OpenAI или DeepSeek. Для распознавания голосовых сообщений нужен Groq.
 - Постоянный диск/volume для пользовательских данных и созданных файлов.
 
 ## Локальный запуск
@@ -14,14 +14,14 @@ Telegram-бот на Python: ИИ-диалоги через Groq, голосов
 1. Создай виртуальное окружение: `python -m venv .venv`.
 2. Активируй его.
 3. Установи зависимости: `python -m pip install -r requirements.txt`.
-4. Скопируй `.env.example` в `.env` и заполни `BOT_TOKEN` и `GROQ_API_KEY`.
+4. Скопируй `.env.example` в `.env` и заполни `BOT_TOKEN` и хотя бы один из `GROQ_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`.
 5. Запусти: `python main.py`.
 
 Бот использует Telegram long polling. Одновременно должен работать только один polling-процесс. Не запускай несколько реплик без отдельной координации лидера/получателя обновлений.
 
 ## Развёртывание
 
-`Procfile` запускает `python main.py`. На платформе хостинга задай `BOT_TOKEN`, `GROQ_API_KEY` и подключи постоянный диск. Рекомендуемый путь — `/data`; другой путь задаётся через `MECAUAI_DATA_DIR`.
+`Procfile` запускает `python main.py`. На платформе хостинга задай `BOT_TOKEN`, один или несколько AI API-ключей и подключи постоянный диск. Рекомендуемый путь — `/data`; другой путь задаётся через `MECAUAI_DATA_DIR`.
 
 HTTP endpoints:
 
@@ -35,7 +35,13 @@ Health endpoints не возвращают токены, пользовател�
 | Переменная | Назначение | По умолчанию |
 |---|---|---|
 | `BOT_TOKEN` | Telegram-токен | обязательно |
-| `GROQ_API_KEY` | Ключ Groq | обязательно |
+| `GROQ_API_KEY` | Ключ Groq (также нужен для распознавания голосовых сообщений) | опционально, если настроен другой AI-провайдер |
+| `OPENAI_API_KEY` | OpenAI API key (оплата API отдельно от подписки ChatGPT) | опционально |
+| `DEEPSEEK_API_KEY` | DeepSeek API key | опционально |
+| `MECAUAI_AI_PROVIDER` | Приоритет провайдера: `auto`, `groq`, `openai`, `deepseek` | `auto` |
+| `OPENAI_TEXT_MODEL` | Текстовая модель OpenAI | `gpt-4.1-mini` |
+| `OPENAI_VISION_MODEL` | Модель OpenAI с поддержкой изображений | `gpt-4o-mini` |
+| `DEEPSEEK_TEXT_MODEL` | Текстовая модель DeepSeek | `deepseek-chat` |
 | `MECAUAI_ADMIN_ID` | Основной Telegram ID администратора | встроенное значение проекта |
 | `MECAUAI_ADMIN_IDS` | Дополнительные ID через запятую | пусто |
 | `MECAUAI_DATA_DIR` | Каталог постоянных данных | `/data`, если доступен, иначе каталог проекта |
@@ -89,3 +95,21 @@ GitHub Actions запускает проверки на Python 3.10, 3.11 и 3.1
 ## Android-приложение (APK)
 
 Отдельный APK в этой версии не добавляется: MecauAI сейчас является Telegram-ботом и работает внутри официального Telegram-клиента. Нативное Android-приложение потребовало бы отдельного клиентского интерфейса, авторизации, API-слоя и самостоятельной поддержки; это лучше делать отдельным проектом после стабилизации серверной части.
+
+### Ошибка `from aiogram.utils import executor`
+
+Проект использует aiogram 3.22.0. В aiogram 3 старый `aiogram.utils.executor` из aiogram 2 удалён; запуск выполняется через `asyncio.run(main())` и `Dispatcher.start_polling()`. Не добавляй в Dockerfile/Build Command проверку `from aiogram.utils import executor`. Для проверки версии используй:
+
+```bash
+python -c "import aiogram; print(aiogram.__version__)"
+```
+
+В репозитории есть Dockerfile, который устанавливает `requirements.txt` и запускает `python main.py` без несовместимого импорта.
+
+### Ошибка Telegram `Unauthorized`
+
+Если токен был отозван через BotFather, хостинг продолжит использовать старое значение, пока ты вручную не заменишь переменную `BOT_TOKEN`. Вставь новый токен в Secrets / Environment Variables хостинга, сохрани изменения и сделай полный redeploy/restart. Не публикуй токен в чате, GitHub или логах.
+
+### Несколько AI-провайдеров
+
+Бот принимает OpenAI API key (`OPENAI_API_KEY`) и DeepSeek API key (`DEEPSEEK_API_KEY`) наряду с Groq. При `MECAUAI_AI_PROVIDER=auto` порядок попыток: Groq, затем OpenAI, затем DeepSeek (только текст). Можно задать приоритет `groq`, `openai` или `deepseek`; при ошибке выбранного провайдера бот попробует другие настроенные провайдеры. OpenAI API оплачивается отдельно и не включён в подписку ChatGPT. Для анализа изображений используется Groq или OpenAI; DeepSeek Chat — текстовый резерв. Распознавание голосовых сообщений в этой версии по-прежнему использует Groq Whisper.

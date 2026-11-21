@@ -2,6 +2,13 @@ import os
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+DEEPSEEK_API_KEY = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
+
+AI_PROVIDER = (os.getenv("MECAUAI_AI_PROVIDER") or "auto").strip().lower()
+OPENAI_TEXT_MODEL = (os.getenv("OPENAI_TEXT_MODEL") or "gpt-4.1-mini").strip()
+OPENAI_VISION_MODEL = (os.getenv("OPENAI_VISION_MODEL") or "gpt-4o-mini").strip()
+DEEPSEEK_TEXT_MODEL = (os.getenv("DEEPSEEK_TEXT_MODEL") or "deepseek-chat").strip()
 
 CHANNEL_1_USERNAME = (os.getenv("MECAUAI_CHANNEL_1_USERNAME") or "MecauAI").strip().lstrip("@") or "MecauAI"
 CHANNEL_1_URL = (os.getenv("MECAUAI_CHANNEL_1_URL") or f"https://t.me/{CHANNEL_1_USERNAME}").strip()
@@ -14,7 +21,8 @@ TEXT_MODEL = (os.getenv("MECAUAI_TEXT_MODEL") or "llama-3.3-70b-versatile").stri
 VISION_MODEL = (os.getenv("MECAUAI_VISION_MODEL") or "qwen/qwen3.6-27b").strip()
 
 
-AD_FOOTER = "\n\n—\n⚡ Нужна учебная работа под заказ? пиши @mecau"
+# Promotional footer disabled: bot replies must contain no unsolicited advertising.
+AD_FOOTER = ""
 
 PROMPTS = {
     "coder": (

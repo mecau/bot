@@ -62,7 +62,8 @@ load_dotenv()
 # не ломало весь бот, а просто отключало соответствующую функцию.
 
 from config import (
-    BOT_TOKEN, GROQ_API_KEY,
+    BOT_TOKEN, GROQ_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY,
+    AI_PROVIDER, OPENAI_TEXT_MODEL, OPENAI_VISION_MODEL, DEEPSEEK_TEXT_MODEL,
     CHANNEL_1_USERNAME, CHANNEL_1_URL,
     CHANNEL_2_USERNAME, CHANNEL_2_URL,
     TEXT_MODEL, VISION_MODEL, PROMPTS, AD_FOOTER
@@ -70,9 +71,9 @@ from config import (
 
 # Fail early with an actionable message instead of a cryptic SDK traceback.
 if not BOT_TOKEN:
-    raise RuntimeError("8943335529:AAHosLofc5TjQSIS3Oi8D50cVh8Hht7lH0I")
-if not GROQ_API_KEY:
-    raise RuntimeError("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")
+    raise RuntimeError("Не задан BOT_TOKEN. Добавьте токен Telegram-бота в переменные окружения.")
+if not any((GROQ_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY)):
+    raise RuntimeError("Не задан ни один AI API-ключ. Добавьте GROQ_API_KEY, OPENAI_API_KEY или DEEPSEEK_API_KEY.")
 
 # Groq model resilience:
 # the configured model can be unavailable for a particular project/key even when
@@ -104,13 +105,12 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-groq_client = AsyncOpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1",
-    timeout=read_env_float("MECAUAI_AI_TIMEOUT_SECONDS", 60.0, 10.0, 180.0),
-    # Retry policy is managed in call_groq_with_retry to avoid nested retries.
-    max_retries=0,
-)
+_AI_TIMEOUT = read_env_float("MECAUAI_AI_TIMEOUT_SECONDS", 60.0, 10.0, 180.0)
+_AI_CLIENT_OPTIONS = {"timeout": _AI_TIMEOUT, "max_retries": 0}
+groq_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", **_AI_CLIENT_OPTIONS) if GROQ_API_KEY else None
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, **_AI_CLIENT_OPTIONS) if OPENAI_API_KEY else None
+# DeepSeek exposes an OpenAI-compatible Chat Completions API.
+deepseek_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com", **_AI_CLIENT_OPTIONS) if DEEPSEEK_API_KEY else None
 
 # Persistent data directory. Set MECAUAI_DATA_DIR to a mounted/persistent volume
 # in the deployment platform. If omitted, use /data when available, otherwise
@@ -1080,7 +1080,10 @@ async def acquire_heavy_job(status_msg=None):
 
 
 async def _refresh_available_models():
-    """Best-effort startup check of models visible to this Groq key/project."""
+    """Best-effort startup check of Groq models; other providers are configured by model IDs."""
+    if not groq_client:
+        logging.info("Groq не настроен; доступны провайдеры: %s", _available_ai_providers())
+        return
     try:
         result = await groq_client.models.list()
         ids = {getattr(m, "id", None) for m in getattr(result, "data", [])}
@@ -1100,93 +1103,98 @@ async def _refresh_available_models():
         logging.warning("Не удалось получить список моделей Groq при старте: %s", exc)
 
 
-def _looks_like_model_access_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return (
-        "model_not_found" in text
-        or "does not exist" in text
-        or "do not have access" in text
-        or "model is not available" in text
-        or "invalid model" in text
-        or "error code: 404" in text
-        or "error code: 403" in text
-    )
+def _available_ai_providers():
+    available = []
+    if groq_client: available.append("groq")
+    if openai_client: available.append("openai")
+    if deepseek_client: available.append("deepseek")
+    return available
 
 
-def _retryable_ai_error(exc: Exception) -> bool:
-    """Retry network, throttling and server failures; fail fast on invalid requests."""
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        response = getattr(exc, "response", None)
-        status = getattr(response, "status_code", None)
-    if status is None:
-        # SDK connection/time-out exceptions often have no HTTP status. Unknown
-        # exceptions are not assumed transient: retrying them only wastes quota.
-        error_name = type(exc).__name__.lower()
-        return isinstance(exc, (TimeoutError, ConnectionError, OSError)) or any(
-            marker in error_name for marker in ("timeout", "connection", "network")
-        )
-    try:
-        status = int(status)
-    except (TypeError, ValueError):
-        return False
-    return status in {408, 409, 425, 429} or 500 <= status <= 599
+def _provider_order(is_vision=False):
+    available = _available_ai_providers()
+    preferred = AI_PROVIDER if AI_PROVIDER in {"groq", "openai", "deepseek"} else ""
+    ordered = ([preferred] if preferred in available else []) + [x for x in ("groq", "openai", "deepseek") if x in available and x != preferred]
+    # DeepSeek Chat is text-only; do not route image payloads to it.
+    if is_vision:
+        ordered = [x for x in ordered if x != "deepseek"]
+    return ordered
+
+
+def _client_for_provider(provider):
+    return {"groq": groq_client, "openai": openai_client, "deepseek": deepseek_client}.get(provider)
+
+
+def _model_for_provider(provider, is_vision=False, requested=None):
+    if provider == "groq":
+        return requested or (VISION_MODEL if is_vision else TEXT_MODEL)
+    if provider == "openai":
+        return OPENAI_VISION_MODEL if is_vision else OPENAI_TEXT_MODEL
+    if provider == "deepseek":
+        return DEEPSEEK_TEXT_MODEL
+    raise RuntimeError(f"Неизвестный AI-провайдер: {provider}")
 
 
 async def call_groq_with_retry(messages, model: str = None, temperature: float = 0.7, max_retries: int = 2, timeout: int = 45):
-    """Bounded Groq call with model fallback and Retry-After-aware exponential backoff."""
-    requested = model or TEXT_MODEL
+    """Совместимый общий AI-вызов: Groq -> OpenAI -> DeepSeek (или заданный приоритет)."""
     is_vision = model == VISION_MODEL
-    candidates = VISION_MODEL_FALLBACKS if is_vision else TEXT_MODEL_FALLBACKS
-    if requested not in candidates:
-        candidates = [requested] + candidates
-    candidates = list(dict.fromkeys(candidates))
-    last_err = None
+    providers = _provider_order(is_vision=is_vision)
+    if not providers:
+        if is_vision and deepseek_client and not (groq_client or openai_client):
+            raise RuntimeError("Для анализа изображений нужен Groq или OpenAI API; DeepSeek Chat не поддерживает изображения.")
+        raise RuntimeError("Не настроен доступный AI-провайдер. Добавьте API-ключ Groq, OpenAI или DeepSeek.")
 
-    for candidate_index, used_model in enumerate(candidates):
-        for attempt in range(max(0, min(int(max_retries), 4)) + 1):
-            try:
-                ai_sem, _ = _get_semaphores()
-                async with ai_sem:
-                    result = await asyncio.wait_for(
-                        groq_client.chat.completions.create(
-                            model=used_model,
-                            messages=messages,
-                            temperature=temperature,
-                        ),
-                        timeout=max(5, min(int(timeout), 180)),
-                    )
-                if used_model != requested:
-                    logging.info("Groq: fallback model selected %s -> %s", requested, used_model)
-                return result
-            except Exception as exc:
-                last_err = exc
-                if _looks_like_model_access_error(exc):
-                    logging.warning("Groq model %s unavailable; trying fallback if available: %s", used_model, exc)
-                    break
-                if not _retryable_ai_error(exc) or attempt >= min(max(0, int(max_retries)), 4):
-                    raise
-                retry_after = None
-                response = getattr(exc, "response", None)
-                headers = getattr(response, "headers", {}) or {}
+    last_err = None
+    for provider in providers:
+        client = _client_for_provider(provider)
+        if provider == "groq":
+            candidates = VISION_MODEL_FALLBACKS if is_vision else TEXT_MODEL_FALLBACKS
+            requested = model or TEXT_MODEL
+            if requested not in candidates:
+                candidates = [requested] + candidates
+        else:
+            candidates = [_model_for_provider(provider, is_vision, model)]
+
+        for used_model in list(dict.fromkeys(candidates)):
+            for attempt in range(max(0, min(int(max_retries), 3)) + 1):
                 try:
-                    retry_after = float(headers.get("retry-after"))
-                except (TypeError, ValueError):
-                    pass
-                delay = min(12.0, retry_after if retry_after is not None else (1.0 * (2 ** attempt)))
-                logging.warning("Groq transient error on %s (%s/%s); retrying in %.1fs: %s", used_model, attempt + 1, max_retries + 1, delay, exc)
-                await asyncio.sleep(delay)
-        if candidate_index < len(candidates) - 1 and last_err is not None and _looks_like_model_access_error(last_err):
+                    ai_sem, _ = _get_semaphores()
+                    async with ai_sem:
+                        result = await asyncio.wait_for(
+                            client.chat.completions.create(model=used_model, messages=messages, temperature=temperature),
+                            timeout=max(5, min(int(timeout), 180)),
+                        )
+                    logging.info("AI provider=%s model=%s", provider, used_model)
+                    return result
+                except Exception as exc:
+                    last_err = exc
+                    if _looks_like_model_access_error(exc) and provider == "groq":
+                        logging.warning("Groq model %s unavailable; trying next model: %s", used_model, exc)
+                        break
+                    if _retryable_ai_error(exc) and attempt < min(max(0, int(max_retries)), 3):
+                        await asyncio.sleep(min(8.0, 1.0 * (2 ** attempt)))
+                        continue
+                    logging.warning("AI provider %s failed; trying next configured provider if available: %s", provider, exc)
+                    break
+            else:
+                continue
+            # If this was a Groq model-access error, continue with its next model.
+            if last_err and _looks_like_model_access_error(last_err) and provider == "groq":
+                continue
+            break
+        if last_err and provider == "groq" and _looks_like_model_access_error(last_err):
             continue
-        if last_err is not None:
-            raise last_err
-    if last_err is not None:
+        # A provider failure should not prevent trying another configured provider.
+        continue
+    if last_err:
         raise last_err
-    raise RuntimeError("No AI model candidates configured")
+    raise RuntimeError("Не удалось выполнить AI-запрос: нет доступных моделей.")
 
 
 async def transcribe_voice(file_bytes: bytes, filename: str = "voice.ogg") -> str:
     """Надёжное распознавание Telegram voice через Groq Whisper."""
+    if not groq_client:
+        raise RuntimeError("Распознавание голосовых сообщений сейчас требует GROQ_API_KEY. Добавьте ключ Groq для этой функции.")
     last_err = None
     for attempt in range(3):
         try:
@@ -4674,7 +4682,7 @@ async def main():
     maintenance = asyncio.create_task(maintenance_loop(), name="mecauai-maintenance")
     try:
         await _refresh_available_models()
-        logging.info("Groq models: text=%s fallbacks=%s vision=%s fallbacks=%s", TEXT_MODEL, TEXT_MODEL_FALLBACKS, VISION_MODEL, VISION_MODEL_FALLBACKS)
+        logging.info("AI providers available=%s preferred=%s; Groq models: text=%s vision=%s", _available_ai_providers(), AI_PROVIDER, TEXT_MODEL, VISION_MODEL)
         logging.info("Persistent users: %s (%d users)", USERS_FILE, len(_all_known_user_ids()))
         logging.info("Persistent user history: %s (%d users)", USER_ACTIVITY_FILE, len(USER_REQUEST_HISTORY))
         logging.info(
@@ -4710,10 +4718,12 @@ async def main():
             await health_runner.cleanup()
         except Exception:
             logging.exception("Health server shutdown error")
-        try:
-            await groq_client.close()
-        except Exception:
-            logging.exception("Groq client shutdown error")
+        for _client_name, _client in (("Groq", groq_client), ("OpenAI", openai_client), ("DeepSeek", deepseek_client)):
+            if _client is not None:
+                try:
+                    await _client.close()
+                except Exception:
+                    logging.exception("%s client shutdown error", _client_name)
         try:
             await bot.session.close()
         except Exception:
