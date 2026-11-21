@@ -71,9 +71,15 @@ from config import (
 
 # Fail early with an actionable message instead of a cryptic SDK traceback.
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN. Добавьте токен Telegram-бота в переменные окружения.")
+    raise RuntimeError("8943335529:AAHosLofc5TjQSIS3Oi8D50cVh8Hht7lH0I")
 if not any((GROQ_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY)):
     raise RuntimeError("Не задан ни один AI API-ключ. Добавьте GROQ_API_KEY, OPENAI_API_KEY или DEEPSEEK_API_KEY.")
+ if not GROQ_API_KEY:
+    raise RuntimeError("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")
+     if not DEEPSEEK_API_KEY:
+    raise RuntimeError("gk-a20eb3b5fd319a0fd2ba2113a4311ea3")
+ if not OPENAI_API_KEY:
+    raise RuntimeError("gk-a20eb3b5fd319a0fd2ba2113a4311ea3")
 
 # Groq model resilience:
 # the configured model can be unavailable for a particular project/key even when
