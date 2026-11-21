@@ -5,13 +5,17 @@ import html
 import io
 import json
 import os
+import shutil
 import re
 import time
 import gc
 import threading
+import zipfile
+import uuid
 from datetime import datetime, timezone
 import urllib.parse
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
@@ -29,7 +33,7 @@ from docx.oxml.ns import qn
 from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt as PptxPt
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.chart.data import ChartData
 from pptx.enum.chart import XL_CHART_TYPE
@@ -40,6 +44,15 @@ from openpyxl.chart import BarChart, Reference
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.utils import get_column_letter
+from dotenv import load_dotenv
+from mecau_core import (
+    read_env_int, read_env_float, normalize_user_record, safe_filename, path_is_within,
+    format_ai_html, split_telegram_html, split_telegram_text, safe_excel_value, safe_excel_formula,
+    normalize_stats_record,
+)
+
+# Load local .env before importing config.py; production env vars take precedence.
+load_dotenv()
 
 # Для вставки картинок в Excel дополнительно нужен пакет Pillow:
 #   pip install pillow
@@ -54,6 +67,12 @@ from config import (
     CHANNEL_2_USERNAME, CHANNEL_2_URL,
     TEXT_MODEL, VISION_MODEL, PROMPTS, AD_FOOTER
 )
+
+# Fail early with an actionable message instead of a cryptic SDK traceback.
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN. Добавьте токен Telegram-бота в переменные окружения.")
+if not GROQ_API_KEY:
+    raise RuntimeError("Не задан GROQ_API_KEY. Добавьте API-ключ Groq в переменные окружения.")
 
 # Groq model resilience:
 # the configured model can be unavailable for a particular project/key even when
@@ -72,7 +91,7 @@ VISION_MODEL_FALLBACKS = [
 TEXT_MODEL_FALLBACKS = list(dict.fromkeys(x for x in TEXT_MODEL_FALLBACKS if x))
 VISION_MODEL_FALLBACKS = list(dict.fromkeys(x for x in VISION_MODEL_FALLBACKS if x))
 
-MY_ADMIN_ID = int(os.getenv("MECAUAI_ADMIN_ID", "1184589026"))
+MY_ADMIN_ID = read_env_int("MECAUAI_ADMIN_ID", 1184589026, 1, 2**63 - 1)
 # Единый набор администраторов для всех новых admin-функций.
 # Дополнительные ID можно передать через MECAUAI_ADMIN_IDS=123,456,789.
 try:
@@ -87,7 +106,10 @@ dp = Dispatcher()
 
 groq_client = AsyncOpenAI(
     api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
+    base_url="https://api.groq.com/openai/v1",
+    timeout=read_env_float("MECAUAI_AI_TIMEOUT_SECONDS", 60.0, 10.0, 180.0),
+    # Retry policy is managed in call_groq_with_retry to avoid nested retries.
+    max_retries=0,
 )
 
 # Persistent data directory. Set MECAUAI_DATA_DIR to a mounted/persistent volume
@@ -102,7 +124,12 @@ def _choose_data_dir():
     return os.path.abspath(os.path.dirname(__file__) or ".")
 
 DATA_DIR = _choose_data_dir()
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+if os.name == "posix":
+    try:
+        os.chmod(DATA_DIR, 0o700)
+    except OSError:
+        logging.warning("Не удалось ограничить права на каталог данных %s", DATA_DIR)
 
 # Юридические документы лежат в корне проекта рядом с main.py.
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__) or ".")
@@ -127,12 +154,10 @@ except Exception as exc:
 
 def _save_admin_ids():
     try:
-        tmp = ADMIN_IDS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as _af:
-            json.dump(sorted(ADMIN_IDS), _af, ensure_ascii=False, indent=2)
-        os.replace(tmp, ADMIN_IDS_FILE)
+        _atomic_json_write(ADMIN_IDS_FILE, sorted(ADMIN_IDS))
     except Exception as exc:
-        logging.error("Не удалось сохранить список администраторов: %s", exc)
+        logging.error("Не удалось сохранить список администраторов: %s", exc, exc_info=True)
+
 
 def _data_file(name):
     return os.path.join(DATA_DIR, name)
@@ -165,23 +190,38 @@ favorites_dirty = False
 users_db_dirty = False
 stats_db_dirty = False
 last_gc_at = 0.0
-GC_INTERVAL_SECONDS = float(os.getenv("MECAUAI_GC_INTERVAL_SECONDS", "45"))
-PERSIST_FLUSH_INTERVAL = float(os.getenv("MECAUAI_PERSIST_FLUSH_INTERVAL", "15"))
+GC_INTERVAL_SECONDS = read_env_float("MECAUAI_GC_INTERVAL_SECONDS", 45.0, 10.0, 600.0)
+PERSIST_FLUSH_INTERVAL = read_env_float("MECAUAI_PERSIST_FLUSH_INTERVAL", 15.0, 3.0, 300.0)
 users_ids_dirty = False
 modes_db_dirty = False
 artifacts_dirty = False
 last_persist_flush_at = 0.0
 
 def load_user_ids() -> set:
-    if os.path.exists(USERS_FILE):
+    if not os.path.exists(USERS_FILE):
+        return set()
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("ожидался JSON-массив")
+        result = set()
+        for value in data:
+            try:
+                uid = int(value)
+                if uid > 0:
+                    result.add(uid)
+            except (TypeError, ValueError):
+                continue
+        return result
+    except Exception as exc:
+        backup = f"{USERS_FILE}.corrupt-{int(time.time())}"
         try:
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return set(data)
-        except Exception:
-            pass
-    return set()
+            os.replace(USERS_FILE, backup)
+            logging.error("Файл %s повреждён и перемещён в %s: %s", USERS_FILE, backup, exc)
+        except OSError:
+            logging.error("Не удалось прочитать %s: %s", USERS_FILE, exc)
+        return set()
 
 def save_user_id(user_id: int):
     global all_users_cache, users_ids_dirty
@@ -202,17 +242,8 @@ all_users_cache = load_user_ids()
 
 def load_favorites() -> dict:
     global favorites_cache
-    if favorites_cache is not None:
-        return favorites_cache
-    if os.path.exists(FAV_FILE):
-        try:
-            with open(FAV_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                favorites_cache = data if isinstance(data, dict) else {}
-                return favorites_cache
-        except Exception:
-            pass
-    favorites_cache = {}
+    if favorites_cache is None:
+        favorites_cache = _load_json_dict(FAV_FILE)
     return favorites_cache
 
 def save_favorites(favs: dict, immediate: bool = False):
@@ -237,15 +268,7 @@ def add_to_favorites(user_id: int, text: str):
         save_favorites(favs)
 
 def load_user_modes() -> dict:
-    if os.path.exists(MODES_FILE):
-        try:
-            with open(MODES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception:
-            pass
-    return {}
+    return _load_json_dict(MODES_FILE)
 
 def save_user_mode(user_id: int, mode: str):
     """Обновляет RAM-кэш; запись на диск выполняется пакетно maintenance_loop."""
@@ -256,31 +279,62 @@ def save_user_mode(user_id: int, mode: str):
 JSON_WRITE_LOCK = threading.Lock()
 
 def _atomic_json_write(path, data):
-    # One-process lock prevents concurrent handlers from racing on the same .tmp file.
+    """Durable same-directory replace; temporary files are unique and private."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
     with JSON_WRITE_LOCK:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            if os.name == "posix":
+                try:
+                    os.chmod(path, 0o600)
+                    dir_fd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
 
 def _load_json_dict(path):
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            if isinstance(data, dict):
+                return data
+            raise ValueError("ожидался JSON-объект")
         except Exception as exc:
-            logging.warning("Не удалось загрузить %s: %s", path, exc)
+            # Preserve a damaged state file for recovery instead of silently
+            # replacing the only copy with an empty database.
+            backup = f"{path}.corrupt-{int(time.time())}"
+            try:
+                os.replace(path, backup)
+                logging.error("Файл %s повреждён и перемещён в %s: %s", path, backup, exc)
+            except OSError:
+                logging.error("Не удалось прочитать %s: %s", path, exc)
     return {}
+
 
 users_db = _load_json_dict(USER_DATA_FILE)
 # JSON keys are strings after loading; normalize user IDs back to int.
 users_db = {int(k): v for k, v in users_db.items()
             if str(k).lstrip("-").isdigit() and isinstance(v, dict)}
 saved_modes_cache = load_user_modes()
-user_stats = {int(k): v for k, v in _load_json_dict(STATS_FILE).items() if str(k).lstrip("-").isdigit() and isinstance(v, dict)}
+user_stats = {int(k): normalize_stats_record(v) for k, v in _load_json_dict(STATS_FILE).items() if str(k).isdigit()}
 ppt_states = set()
 excel_states = set()
 doc_analysis_states = set()
@@ -304,9 +358,10 @@ ppt_creation_users = set()
 # тяжёлых генераций и десятки обращений к AI.
 AI_SEMAPHORE = None
 HEAVY_JOB_SEMAPHORE = None
-MAX_AI_CONCURRENCY = 2
-MAX_HEAVY_CONCURRENCY = 1
-MAX_HEAVY_QUEUE = int(os.getenv("MECAUAI_MAX_HEAVY_QUEUE", "3"))
+# Tunable concurrency: defaults remain conservative for small VPS instances.
+MAX_AI_CONCURRENCY = read_env_int("MECAUAI_MAX_AI_CONCURRENCY", 2, 1, 8)
+MAX_HEAVY_CONCURRENCY = read_env_int("MECAUAI_MAX_HEAVY_CONCURRENCY", 1, 1, 3)
+MAX_HEAVY_QUEUE = read_env_int("MECAUAI_MAX_HEAVY_QUEUE", 3, 0, 20)
 HEAVY_WAITERS = 0
 MAX_PPT_IMAGES = 8
 MAX_PPT_AI_IMAGES = 4
@@ -314,7 +369,7 @@ MAX_PPT_AI_IMAGES = 4
 # ===== MecauAI 2.0: единый registry артефактов + лёгкий persistence =====
 ARTIFACT_DIR = os.path.abspath(os.getenv("MECAUAI_ARTIFACT_DIR", os.path.join(DATA_DIR, "generated_files")))
 ARTIFACTS_FILE = os.path.abspath(os.getenv("MECAUAI_ARTIFACTS_FILE", os.path.join(DATA_DIR, "artifacts.json")))
-ARTIFACT_TTL_SECONDS = int(os.getenv("MECAUAI_ARTIFACT_TTL_SECONDS", str(24 * 3600)))
+ARTIFACT_TTL_SECONDS = read_env_int("MECAUAI_ARTIFACT_TTL_SECONDS", 24 * 3600, 600, 30 * 24 * 3600)
 MAX_ARTIFACTS_PER_USER = 6
 MAX_ARTIFACT_BYTES = 25 * 1024 * 1024
 RESOURCE_CHECK_INTERVAL = 60
@@ -339,11 +394,11 @@ def _detect_memory_limit_mb():
 
 _CONTAINER_RAM_MB = _detect_memory_limit_mb()
 if os.getenv("MECAUAI_RAM_SOFT_LIMIT_MB"):
-    RAM_SOFT_LIMIT_MB = int(os.getenv("MECAUAI_RAM_SOFT_LIMIT_MB"))
+    RAM_SOFT_LIMIT_MB = read_env_int("MECAUAI_RAM_SOFT_LIMIT_MB", 700, 192, 65536)
 else:
     RAM_SOFT_LIMIT_MB = int(_CONTAINER_RAM_MB * 0.70) if _CONTAINER_RAM_MB else 700
 if os.getenv("MECAUAI_RAM_HARD_LIMIT_MB"):
-    RAM_HARD_LIMIT_MB = int(os.getenv("MECAUAI_RAM_HARD_LIMIT_MB"))
+    RAM_HARD_LIMIT_MB = read_env_int("MECAUAI_RAM_HARD_LIMIT_MB", 900, 256, 65536)
 else:
     RAM_HARD_LIMIT_MB = int(_CONTAINER_RAM_MB * 0.82) if _CONTAINER_RAM_MB else 900
 # Не даём watchdog сработать на совсем маленьком baseline, но и не позволяем
@@ -364,10 +419,7 @@ def _artifact_lock():
 def _load_artifacts():
     global artifact_registry
     try:
-        if os.path.exists(ARTIFACTS_FILE):
-            with open(ARTIFACTS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            artifact_registry = data if isinstance(data, dict) else {}
+        artifact_registry = _load_json_dict(ARTIFACTS_FILE)
     except Exception as e:
         logging.warning("Не удалось загрузить registry артефактов: %s", e)
         artifact_registry = {}
@@ -384,16 +436,28 @@ def _save_artifacts(immediate: bool = False):
         logging.warning("Не удалось сохранить registry артефактов: %s", e, exc_info=True)
 
 _load_artifacts()
-os.makedirs(ARTIFACT_DIR, exist_ok=True)
+os.makedirs(ARTIFACT_DIR, mode=0o700, exist_ok=True)
+if os.name == "posix":
+    try:
+        os.chmod(ARTIFACT_DIR, 0o700)
+    except OSError:
+        logging.warning("Не удалось ограничить права на каталог артефактов %s", ARTIFACT_DIR)
 
 def _artifact_path(user_id, ext, stem):
-    safe = re.sub(r"[^A-Za-zА-Яа-я0-9_-]+", "_", str(stem))[:45].strip("_") or "file"
-    uid_dir = os.path.join(ARTIFACT_DIR, str(user_id))
-    os.makedirs(uid_dir, exist_ok=True)
-    return os.path.join(uid_dir, f"{int(time.time())}_{safe}.{ext}")
+    safe = safe_filename(stem, fallback="file", limit=45)
+    extension = re.sub(r"[^a-z0-9]", "", str(ext or "").lower())[:8] or "bin"
+    uid_dir = os.path.join(ARTIFACT_DIR, str(int(user_id)))
+    os.makedirs(uid_dir, mode=0o700, exist_ok=True)
+    if os.name == "posix":
+        try:
+            os.chmod(uid_dir, 0o700)
+        except OSError:
+            pass
+    return os.path.join(uid_dir, f"{int(time.time())}_{uuid.uuid4().hex[:8]}_{safe}.{extension}")
 
 def register_artifact(user_id, kind, path, meta=None):
-    if not path or not os.path.exists(path):
+    if not path or not os.path.isfile(path) or not path_is_within(path, ARTIFACT_DIR):
+        logging.warning("Rejected artifact registration outside generated_files: %r", path)
         return None
     entry = {"kind": kind, "path": os.path.abspath(path), "created": time.time(), "meta": meta or {}}
     items = artifact_registry.setdefault(str(user_id), [])
@@ -404,9 +468,14 @@ def register_artifact(user_id, kind, path, meta=None):
 
 def last_artifact(user_id, kind=None):
     items = artifact_registry.get(str(user_id), [])
+    if not isinstance(items, list):
+        return None
     for item in reversed(items):
+        if not isinstance(item, dict):
+            continue
         if kind is None or item.get("kind") == kind:
-            if os.path.exists(item.get("path", "")):
+            item_path = str(item.get("path") or "")
+            if item_path and path_is_within(item_path, ARTIFACT_DIR) and os.path.isfile(item_path):
                 return item
     return None
 
@@ -443,17 +512,30 @@ def cleanup_artifacts():
     for uid, items in list(artifact_registry.items()):
         kept = []
         for item in items:
-            path = item.get("path", "")
-            age = now - float(item.get("created", now))
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            path = str(item.get("path") or "")
+            if not path or not path_is_within(path, ARTIFACT_DIR):
+                logging.warning("Ignoring artifact path outside artifact directory: %r", path)
+                changed = True
+                continue
             try:
-                size = os.path.getsize(path) if os.path.exists(path) else 0
-                if path and os.path.exists(path) and (age > ARTIFACT_TTL_SECONDS or size > MAX_ARTIFACT_BYTES):
-                    os.remove(path); changed = True
+                created = float(item.get("created", now))
+                age = max(0.0, now - created)
+                exists = os.path.isfile(path)
+                size = os.path.getsize(path) if exists else 0
+                if exists and (age > ARTIFACT_TTL_SECONDS or size > MAX_ARTIFACT_BYTES):
+                    os.remove(path)
+                    changed = True
                     continue
-            except Exception:
-                pass
-            if os.path.exists(path):
-                kept.append(item)
+                if exists:
+                    kept.append(item)
+                else:
+                    changed = True
+            except (OSError, TypeError, ValueError) as exc:
+                logging.warning("Could not reconcile artifact %r: %s", path, exc)
+                changed = True
         if kept:
             artifact_registry[uid] = kept[-MAX_ARTIFACTS_PER_USER:]
         else:
@@ -507,6 +589,8 @@ def _cleanup_orphan_artifact_files():
             if name.endswith('.tmp'):
                 continue
             path = os.path.join(base, name)
+            if not path_is_within(path, root):
+                continue
             try:
                 if now - os.path.getmtime(path) > ARTIFACT_TTL_SECONDS:
                     os.remove(path)
@@ -524,6 +608,16 @@ async def maintenance_loop():
                 logging.warning("Disk watchdog: only %.0f MB free — cleaning generated files", free_mb)
                 cleanup_artifacts()
                 _cleanup_orphan_artifact_files()
+            # Expire large per-user document chunks to keep RAM predictable.
+            now_wall = time.time()
+            for uid, context in list(user_doc_chunks.items()):
+                try:
+                    if now_wall - float(context.get("created_at", now_wall)) > DOC_CONTEXT_TTL_SECONDS:
+                        user_doc_chunks.pop(uid, None)
+                        user_doc_context.pop(uid, None)
+                except (TypeError, ValueError, AttributeError):
+                    user_doc_chunks.pop(uid, None)
+                    user_doc_context.pop(uid, None)
             # Bounded TTL cache cleanup. Проверку подписки не меняем — чистим только истёкшие записи.
             if len(subscription_cache) > 2000:
                 cutoff_sub = time.monotonic() - SUBSCRIPTION_CACHE_TTL
@@ -564,16 +658,31 @@ def _file_safe_size(path):
 
 
 def _atomic_write_bytes(path, data: bytes):
-    """Записывает артефакт транзакционно, чтобы сбой не оставил битый файл."""
+    """Write generated artifacts atomically without exposing partial files."""
     if not data or len(data) > MAX_ARTIFACT_BYTES:
         raise ValueError("Артефакт пустой или превышает допустимый размер")
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    return path
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        if os.name == "posix":
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        return path
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def set_task_state(user_id: int, **kwargs):
@@ -613,7 +722,7 @@ user_doc_chunks = {}  # user_id -> {name, chunks:[{page,text}]}
 
 # Лёгкая аналитика поведения — без хранения содержимого сообщений.
 user_rate_buckets = {}
-SUBSCRIPTION_CACHE_TTL = int(os.getenv("MECAUAI_SUBSCRIPTION_CACHE_TTL", "30"))
+SUBSCRIPTION_CACHE_TTL = read_env_int("MECAUAI_SUBSCRIPTION_CACHE_TTL", 30, 0, 300)
 subscription_cache = {}
 
 def allow_request(user_id: int, limit: int = 15, window: int = 30) -> bool:
@@ -665,15 +774,9 @@ async def _ingress_allowed(message: Message, limit: int, window: int, label: str
     return True
 
 def get_user_stats(user_id: int):
-    if user_id not in user_stats:
-        user_stats[user_id] = {
-            "messages": 0,
-            "voice": 0,
-            "files": 0,
-            "images": 0,
-            "exports": 0,
-            "last_action": None,
-        }
+    # Старые/частично записанные строки статистики не должны ломать обработчик
+    # при инкременте отсутствующего счётчика.
+    user_stats[user_id] = normalize_stats_record(user_stats.get(user_id))
     return user_stats[user_id]
 
 def remember_action(user_id: int, action: str):
@@ -682,25 +785,8 @@ def remember_action(user_id: int, action: str):
     stats["messages"] += 1
 
 def clean_text_for_html(text: str) -> str:
-    """Подготавливает ответ ИИ для Telegram HTML: убирает Markdown-артефакты и экранирует опасные HTML-символы."""
-    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    # Telegram HTML допускает только ограниченный набор тегов. Сохраняем простые
-    # заголовки/жирный/курсив, а остальные '<' и '>' экранируем.
-    placeholders = {}
-    allowed = re.compile(r"</?(?:b|strong|i|em|u|s|code|pre|blockquote)(?:\s[^>]*)?>", re.I)
-    def protect(m):
-        key = f"__MECAU_TAG_{len(placeholders)}__"
-        placeholders[key] = m.group(0)
-        return key
-    text = allowed.sub(protect, text)
-    text = html.escape(text, quote=False)
-    for key, tag in placeholders.items():
-        text = text.replace(key, tag)
-    # Базовое Markdown-оформление переводим в Telegram HTML.
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
-    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", text)
-    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
-    return text.strip()
+    """Safe Telegram HTML formatter; raw HTML from a model is escaped."""
+    return format_ai_html(text)
 
 
 def extract_json(text: str):
@@ -808,27 +894,32 @@ def get_create_keyboard():
 
 
 async def safe_answer(message: Message, text: str, parse_mode: str = None, reply_markup=None, disable_web_page_preview: bool = True):
-    """
-    Безопасная отправка сообщения: если Telegram не может распарсить
-    HTML/Markdown в ответе ИИ (например, из-за случайных символов < > _ *),
-    бот отправит тот же текст обычным сообщением вместо падения с ошибкой.
-    """
-    try:
-        return await message.answer(
-            text, parse_mode=parse_mode, reply_markup=reply_markup,
-            disable_web_page_preview=disable_web_page_preview
-        )
-    except Exception as e:
-        logging.warning(f"Не удалось отправить с parse_mode={parse_mode}, отправляю без форматирования: {e}")
-        plain_text = re.sub(r'<[^>]+>', '', text) if parse_mode == "HTML" else text
+    """Send long replies in Telegram-sized chunks and recover from invalid markup."""
+    rendered = str(text or "")
+    chunks = split_telegram_html(rendered, max_chars=3800) if parse_mode == "HTML" else split_telegram_text(rendered, max_chars=3800)
+    last_sent = None
+    for index, chunk in enumerate(chunks):
+        markup = reply_markup if index == len(chunks) - 1 else None
         try:
-            return await message.answer(
-                plain_text, reply_markup=reply_markup,
+            last_sent = await message.answer(
+                chunk, parse_mode=parse_mode, reply_markup=markup,
                 disable_web_page_preview=disable_web_page_preview
             )
-        except Exception as e2:
-            logging.error(f"Повторная ошибка при отправке сообщения: {e2}")
-            return None
+        except TelegramBadRequest as exc:
+            logging.warning("Telegram rejected formatted response; retrying as plain text: %s", exc)
+            plain = html.unescape(re.sub(r"</?(?:b|strong|i|em|u|s|code|pre|blockquote)>", "", chunk, flags=re.I))
+            try:
+                last_sent = await message.answer(
+                    plain[:3900], reply_markup=markup,
+                    disable_web_page_preview=disable_web_page_preview
+                )
+            except Exception as retry_exc:
+                logging.error("Plain-text fallback failed: %s", retry_exc, exc_info=True)
+                return last_sent
+        except Exception as exc:
+            logging.error("Не удалось отправить сообщение: %s", exc, exc_info=True)
+            return last_sent
+    return last_sent
 
 
 def get_help_keyboard():
@@ -858,15 +949,7 @@ def get_settings_keyboard():
 MAX_USER_LAST_OUTPUT_CHARS = 4000
 
 def _trim_user_record(record):
-    if not isinstance(record, dict):
-        return {"mode": "ai", "history": [], "last_output": ""}
-    history = record.get("history") or []
-    if isinstance(history, list):
-        record["history"] = history[-6:]
-    else:
-        record["history"] = []
-    record["last_output"] = str(record.get("last_output") or "")[-MAX_USER_LAST_OUTPUT_CHARS:]
-    return record
+    return normalize_user_record(record, max_history=6, max_output_chars=MAX_USER_LAST_OUTPUT_CHARS)
 
 # Bound resident user history/output after startup so old oversized records
 # cannot keep unnecessary RAM alive for the entire process lifetime.
@@ -934,6 +1017,11 @@ def get_user_data(user_id: int):
             "last_output": "Здесь пока нет ответов."
         }
         save_users_db()
+    else:
+        repaired = _trim_user_record(users_db[user_id])
+        if repaired != users_db[user_id]:
+            users_db[user_id] = repaired
+            save_users_db()
     return users_db[user_id]
 
 def clear_pending_states(user_id: int):
@@ -963,6 +1051,10 @@ def _get_semaphores():
     return AI_SEMAPHORE, HEAVY_JOB_SEMAPHORE
 
 
+class HeavyJobRejected(RuntimeError):
+    """A bounded heavy-task queue cannot safely accept another generation."""
+
+
 async def acquire_heavy_job(status_msg=None):
     global HEAVY_WAITERS
     _, heavy = _get_semaphores()
@@ -971,11 +1063,11 @@ async def acquire_heavy_job(status_msg=None):
         _maybe_gc()
         current_ram = _memory_mb()
         if current_ram >= RAM_HARD_LIMIT_MB:
-            raise RuntimeError(f"Сервер временно перегружен по памяти ({current_ram:.0f} MB). Повтори задачу через минуту.")
+            raise HeavyJobRejected(f"Сервер временно перегружен по памяти ({current_ram:.0f} MB). Повтори задачу через минуту.")
     queued=False
     if heavy.locked():
         if HEAVY_WAITERS >= MAX_HEAVY_QUEUE:
-            raise RuntimeError("Сервер временно занят: очередь тяжёлых задач заполнена")
+            raise HeavyJobRejected("Сервер временно занят: очередь тяжёлых задач заполнена")
         HEAVY_WAITERS += 1; queued=True
         if status_msg is not None:
             try: await status_msg.edit_text("⏳ Сервер занят. Задача поставлена в короткую очередь — я не перегружаю VPS.")
@@ -1021,22 +1113,38 @@ def _looks_like_model_access_error(exc: Exception) -> bool:
     )
 
 
+def _retryable_ai_error(exc: Exception) -> bool:
+    """Retry network, throttling and server failures; fail fast on invalid requests."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status is None:
+        # SDK connection/time-out exceptions often have no HTTP status. Unknown
+        # exceptions are not assumed transient: retrying them only wastes quota.
+        error_name = type(exc).__name__.lower()
+        return isinstance(exc, (TimeoutError, ConnectionError, OSError)) or any(
+            marker in error_name for marker in ("timeout", "connection", "network")
+        )
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return False
+    return status in {408, 409, 425, 429} or 500 <= status <= 599
+
+
 async def call_groq_with_retry(messages, model: str = None, temperature: float = 0.7, max_retries: int = 2, timeout: int = 45):
-    """
-    Надёжный вызов Groq.
-    Если конкретная модель недоступна для ключа/проекта, автоматически
-    переключается на доступную резервную модель. Сетевые/временные ошибки
-    по-прежнему получают повторные попытки.
-    """
+    """Bounded Groq call with model fallback and Retry-After-aware exponential backoff."""
     requested = model or TEXT_MODEL
     is_vision = model == VISION_MODEL
     candidates = VISION_MODEL_FALLBACKS if is_vision else TEXT_MODEL_FALLBACKS
     if requested not in candidates:
         candidates = [requested] + candidates
-
+    candidates = list(dict.fromkeys(candidates))
     last_err = None
-    for candidate_index, used_model in enumerate(dict.fromkeys(candidates)):
-        for attempt in range(max_retries + 1):
+
+    for candidate_index, used_model in enumerate(candidates):
+        for attempt in range(max(0, min(int(max_retries), 4)) + 1):
             try:
                 ai_sem, _ = _get_semaphores()
                 async with ai_sem:
@@ -1044,35 +1152,37 @@ async def call_groq_with_retry(messages, model: str = None, temperature: float =
                         groq_client.chat.completions.create(
                             model=used_model,
                             messages=messages,
-                            temperature=temperature
+                            temperature=temperature,
                         ),
-                        timeout=timeout
+                        timeout=max(5, min(int(timeout), 180)),
                     )
                 if used_model != requested:
-                    logging.info("Groq: модель %s недоступна, успешно использована резервная %s", requested, used_model)
+                    logging.info("Groq: fallback model selected %s -> %s", requested, used_model)
                 return result
-            except Exception as e:
-                last_err = e
-                if _looks_like_model_access_error(e):
-                    logging.warning(
-                        "Groq: модель %s недоступна (попытка %s/%s): %s",
-                        used_model, attempt + 1, max_retries + 1, e
-                    )
-                    # Нет смысла трижды повторять гарантированно недоступную модель.
+            except Exception as exc:
+                last_err = exc
+                if _looks_like_model_access_error(exc):
+                    logging.warning("Groq model %s unavailable; trying fallback if available: %s", used_model, exc)
                     break
-                logging.warning(
-                    "Groq API — модель %s, попытка %s/%s не удалась: %s",
-                    used_model, attempt + 1, max_retries + 1, e
-                )
-                if attempt < max_retries:
-                    await asyncio.sleep(1.5 * (attempt + 1))
+                if not _retryable_ai_error(exc) or attempt >= min(max(0, int(max_retries)), 4):
+                    raise
+                retry_after = None
+                response = getattr(exc, "response", None)
+                headers = getattr(response, "headers", {}) or {}
+                try:
+                    retry_after = float(headers.get("retry-after"))
+                except (TypeError, ValueError):
+                    pass
+                delay = min(12.0, retry_after if retry_after is not None else (1.0 * (2 ** attempt)))
+                logging.warning("Groq transient error on %s (%s/%s); retrying in %.1fs: %s", used_model, attempt + 1, max_retries + 1, delay, exc)
+                await asyncio.sleep(delay)
         if candidate_index < len(candidates) - 1 and last_err is not None and _looks_like_model_access_error(last_err):
-            logging.warning("Groq: переключаюсь с %s на следующую резервную модель", used_model)
             continue
-        if last_err is not None and not _looks_like_model_access_error(last_err):
-            break
-
-    raise last_err
+        if last_err is not None:
+            raise last_err
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("No AI model candidates configured")
 
 
 async def transcribe_voice(file_bytes: bytes, filename: str = "voice.ogg") -> str:
@@ -1700,7 +1810,7 @@ def build_title_slide(prs, theme, topic_text):
     _set_text_style(p, 11, theme["subtitle_text"], True)
 
     title = slide.shapes.add_textbox(PptxInches(0.9), PptxInches(2.0), PptxInches(11.2), PptxInches(2.2))
-    tf = title.text_frame; tf.word_wrap = True
+    tf = title.text_frame; tf.word_wrap = True; tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     p = tf.paragraphs[0]; p.text = str(topic_text).strip()[:180]; p.alignment = PP_ALIGN.LEFT
     _set_text_style(p, 34 if len(str(topic_text)) < 80 else 28, theme["title_text"], True)
 
@@ -1783,7 +1893,7 @@ def _ppt_count_keyboard():
 async def _start_ppt_flow(message,user_id,topic=None):
     clear_pending_states(user_id)
     if topic: user_ppt_topic[user_id]=topic.strip()[:2500]
-    await message.answer("🎨 <b>Шаг 1/3 — выбери дизайн презентации</b>\n\nПосле дизайна я предложу количество слайдов, затем запрошу тему.",parse_mode="HTML",reply_markup=_ppt_design_keyboard())
+    await message.answer("🎨 <b>Шаг 1/3 — выбери дизайн презентации</b>\n\nПосле дизайна выберешь общее количество слайдов (включая титульный), затем укажешь тему.",parse_mode="HTML",reply_markup=_ppt_design_keyboard())
 
 @dp.message(F.text == "📈 Презентация")
 async def cmd_ppt_prompt(message: Message):
@@ -1801,7 +1911,7 @@ async def cb_ppt_design(callback: types.CallbackQuery):
     uid=callback.from_user.id; user_ppt_design[uid]=callback.data; ppt_states.add(uid)
     try: await callback.message.edit_text(f"🎨 <b>Шаг 1/3 — дизайн:</b> {PPT_THEMES[callback.data]['label']}",parse_mode="HTML")
     except Exception: pass
-    await callback.message.answer("📑 <b>Шаг 2/3 — сколько содержательных слайдов?</b>\n\nТитульный слайд добавится автоматически.",parse_mode="HTML",reply_markup=_ppt_count_keyboard())
+    await callback.message.answer("📑 <b>Шаг 2/3 — сколько всего слайдов?</b>\n\nКоличество уже включает титульный лист — итоговое число будет точно таким, как выберешь.",parse_mode="HTML",reply_markup=_ppt_count_keyboard())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("ppt_count_"))
@@ -1813,7 +1923,7 @@ async def cb_ppt_count(callback: types.CallbackQuery):
     except Exception: await callback.answer("Некорректное количество",show_alert=True); return
     if count not in PPT_SLIDE_COUNTS: await callback.answer("Недоступное количество",show_alert=True); return
     user_ppt_slide_count[uid]=count; ppt_states.add(uid); topic=user_ppt_topic.get(uid)
-    try: await callback.message.edit_text(f"📑 <b>Шаг 2/3 — {count} содержательных слайдов</b>",parse_mode="HTML")
+    try: await callback.message.edit_text(f"📑 <b>Шаг 2/3 — ровно {count} слайдов, включая титульный</b>",parse_mode="HTML")
     except Exception: pass
     if topic:
         await callback.message.answer(f"📌 <b>Шаг 3/3 — тема уже получена:</b> «{topic[:300]}»\n\nОтправь свои картинки или сразу нажми «🚀 Начать генерацию».",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Начать генерацию",callback_data="ppt_start")],[InlineKeyboardButton(text="❌ Отмена",callback_data="cancel_flow")]]))
@@ -1916,7 +2026,12 @@ async def cb_excel_mode(callback: types.CallbackQuery):
 # ======================= АНАЛИЗ ДОКУМЕНТОВ =======================
 
 MAX_DOC_CONTEXT_CHARS = 12000
-MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024  # ограничение Telegram Bot API на скачивание файла
+MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024
+MAX_EXTRACTED_DOC_CHARS = read_env_int("MECAUAI_MAX_EXTRACTED_DOC_CHARS", 500000, 50000, 1500000)
+MAX_PDF_PAGES = read_env_int("MECAUAI_MAX_PDF_PAGES", 200, 10, 500)
+MAX_DOCX_UNCOMPRESSED_BYTES = read_env_int("MECAUAI_MAX_DOCX_UNCOMPRESSED_BYTES", 80000000, 10000000, 200000000)
+DOC_CONTEXT_TTL_SECONDS = read_env_int("MECAUAI_DOC_CONTEXT_TTL_SECONDS", 3600, 300, 86400)
+MAX_ACTIVE_DOCUMENT_CONTEXTS = read_env_int("MECAUAI_MAX_ACTIVE_DOCUMENT_CONTEXTS", 40, 5, 500)
 
 @dp.message(F.text == "📚 Анализ документа")
 async def cmd_doc_analysis_prompt(message: Message):
@@ -1935,45 +2050,92 @@ async def cmd_doc_analysis_prompt(message: Message):
         parse_mode="HTML"
     )
 
-async def extract_text_from_document(ext: str, file_bytes: bytes):
-    """Извлекает текст и структурированные фрагменты документа."""
+def _extract_text_from_document_sync(ext: str, file_bytes: bytes):
+    """CPU/file parser worker. Called through asyncio.to_thread by the handler."""
+    ext = str(ext or "").lower().lstrip(".")
     if ext == "txt":
-        raw=file_bytes.decode("utf-8",errors="ignore")
-        return raw,[{"page":None,"text":raw}],None
+        try:
+            raw = file_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raw = file_bytes.decode("cp1251", errors="replace")
+        raw = raw[:MAX_EXTRACTED_DOC_CHARS]
+        return raw, [{"page": None, "text": raw}], None
     if ext == "docx":
         try:
-            d=Document(io.BytesIO(file_bytes)); blocks=[]
-            for p in d.paragraphs:
-                if p.text.strip(): blocks.append(p.text.strip())
-            for table in d.tables:
-                rows=[]
-                for row in table.rows:
-                    vals=[c.text.replace("\n"," ").strip() for c in row.cells]
-                    if any(vals): rows.append(" | ".join(vals))
-                if rows: blocks.append("[ТАБЛИЦА]\n"+"\n".join(rows))
-            raw="\n\n".join(blocks)
-            return raw,[{"page":None,"text":raw}],None
-        except Exception as e:
-            return None,None,f"⚠️ Не удалось прочитать DOCX: {e}"
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+                infos = archive.infolist()
+                uncompressed = sum(info.file_size for info in infos)
+                if len(infos) > 5000 or uncompressed > MAX_DOCX_UNCOMPRESSED_BYTES:
+                    return None, None, "⚠️ DOCX содержит слишком много данных для безопасной обработки. Сократи документ и отправь снова."
+                if any(info.file_size > 0 and info.compress_size == 0 for info in infos):
+                    return None, None, "⚠️ Структура DOCX выглядит повреждённой. Пересохрани файл в Word и отправь снова."
+            d = Document(io.BytesIO(file_bytes))
+            blocks = []
+            total = 0
+            for paragraph in d.paragraphs:
+                value = paragraph.text.strip()
+                if value:
+                    blocks.append(value)
+                    total += len(value)
+                if total >= MAX_EXTRACTED_DOC_CHARS:
+                    break
+            if total < MAX_EXTRACTED_DOC_CHARS:
+                for table in d.tables:
+                    rows = []
+                    for row in table.rows:
+                        vals = [cell.text.replace("\n", " ").strip()[:500] for cell in row.cells]
+                        if any(vals):
+                            rows.append(" | ".join(vals))
+                            total += sum(map(len, vals))
+                        if total >= MAX_EXTRACTED_DOC_CHARS:
+                            break
+                    if rows:
+                        blocks.append("[ТАБЛИЦА]\n" + "\n".join(rows))
+                    if total >= MAX_EXTRACTED_DOC_CHARS:
+                        break
+            raw = "\n\n".join(blocks)[:MAX_EXTRACTED_DOC_CHARS]
+            return raw, [{"page": None, "text": raw}], None
+        except Exception as exc:
+            logging.warning("DOCX extraction failed: %s", exc, exc_info=True)
+            return None, None, "⚠️ Не удалось прочитать DOCX. Проверь, что файл не повреждён и не защищён паролем."
     if ext == "pdf":
         try:
             from pypdf import PdfReader
-        except ImportError:
-            return None,None,"⚠️ Для чтения PDF нужна библиотека pypdf. Установи: pip install pypdf"
-        try:
-            reader=PdfReader(io.BytesIO(file_bytes)); pages=[]
-            for n,page in enumerate(reader.pages,1):
-                t=(page.extract_text() or "").strip()
-                if t: pages.append({"page":n,"text":t})
-            raw="\n\n".join(f"[Страница {x['page']}]\n{x['text']}" for x in pages)
-            return raw,pages,None
-        except Exception as e:
-            return None,None,f"⚠️ Не удалось прочитать PDF: {e}"
-    return None,None,"⚠️ Поддерживаются .pdf, .docx и .txt."
+            reader = PdfReader(io.BytesIO(file_bytes), strict=False)
+            if reader.is_encrypted:
+                return None, None, "⚠️ PDF защищён паролем. Сними защиту и отправь файл повторно."
+            if len(reader.pages) > MAX_PDF_PAGES:
+                return None, None, f"⚠️ В PDF слишком много страниц (лимит — {MAX_PDF_PAGES}). Раздели документ на части."
+            pages = []
+            total = 0
+            for page_no, page in enumerate(reader.pages, 1):
+                extracted = (page.extract_text() or "").strip()
+                if not extracted:
+                    continue
+                remaining = MAX_EXTRACTED_DOC_CHARS - total
+                if remaining <= 0:
+                    break
+                extracted = extracted[:remaining]
+                pages.append({"page": page_no, "text": extracted})
+                total += len(extracted)
+            raw = "\n\n".join(f"[Страница {item['page']}]\n{item['text']}" for item in pages)
+            return raw, pages, None
+        except Exception as exc:
+            logging.warning("PDF extraction failed: %s", exc, exc_info=True)
+            return None, None, "⚠️ Не удалось прочитать PDF. Возможно, файл повреждён или содержит нестандартную структуру."
+    return None, None, "⚠️ Поддерживаются .pdf, .docx и .txt."
+
+
+async def extract_text_from_document(ext: str, file_bytes: bytes):
+    """Run document parsing off the event loop so large files do not freeze the bot."""
+    return await asyncio.to_thread(_extract_text_from_document_sync, ext, file_bytes)
+
 
 def _chunk_document(pages, size=5000, overlap=600):
     out=[]
     for page in pages or []:
+        if not isinstance(page, dict):
+            continue
         raw=str(page.get("text") or "").strip()
         pos=0
         while raw and pos < len(raw):
@@ -1984,7 +2146,17 @@ def _chunk_document(pages, size=5000, overlap=600):
     return out
 
 def _select_document_context(user_id, query="", limit=14000):
-    data=user_doc_chunks.get(user_id) or {}; chunks=data.get("chunks") or []
+    data=user_doc_chunks.get(user_id) or {}
+    created_at = data.get("created_at")
+    try:
+        expired = bool(created_at) and time.time() - float(created_at) > DOC_CONTEXT_TTL_SECONDS
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
+        user_doc_chunks.pop(user_id, None)
+        user_doc_context.pop(user_id, None)
+        return ""
+    chunks=data.get("chunks") or []
     if not chunks: return user_doc_context.get(user_id,"")[:limit]
     words=re.findall(r"[a-zа-яё0-9]{3,}",(query or "").lower())[:50]
     scored=[]
@@ -2007,7 +2179,15 @@ async def process_document_context(message: Message, filename: str, text: str, p
         await status_msg.edit_text("⚠️ Текстовый слой не найден. Если это скан, пришли страницы как фото — я разберу их через Vision.")
         doc_analysis_states.discard(user_id); return
     chunks=_chunk_document(pages or [{"page":None,"text":text}])
-    user_doc_chunks[user_id]={"name":filename,"chunks":chunks}
+    if user_id not in user_doc_chunks and len(user_doc_chunks) >= MAX_ACTIVE_DOCUMENT_CONTEXTS:
+        oldest_uid = min(
+            user_doc_chunks,
+            key=lambda uid: float((user_doc_chunks.get(uid) or {}).get("created_at", 0) or 0),
+        )
+        user_doc_chunks.pop(oldest_uid, None)
+        user_doc_context.pop(oldest_uid, None)
+        logging.info("Document context evicted for user %s (active-context cap)", oldest_uid)
+    user_doc_chunks[user_id]={"name":filename,"chunks":chunks,"created_at":time.time()}
     user_doc_context[user_id]=_select_document_context(user_id,"",14000)
     doc_analysis_states.discard(user_id)
     try:
@@ -2035,10 +2215,6 @@ async def handle_document(message: Message):
     if user_id in busy_users:
         await message.answer("⏳ Подожди, предыдущая задача ещё выполняется...")
         return
-    doc_analysis_states.add(user_id)
-
-    get_user_stats(user_id)["files"] += 1
-    save_stats_db()
     doc = message.document
     filename = doc.file_name or "документ"
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
@@ -2049,9 +2225,13 @@ async def handle_document(message: Message):
         await message.answer("⚠️ Файл слишком большой (лимит Telegram на скачивание — 20 МБ).")
         return
 
+    get_user_stats(user_id)["files"] += 1
+    remember_action(user_id, "document")
+    save_stats_db()
     busy_users.add(user_id)
-    status_msg = await message.answer("📚 Читаю документ...")
+    status_msg = None
     try:
+        status_msg = await message.answer("📚 Читаю документ...")
         file_info = await bot.get_file(doc.file_id)
         downloaded = await bot.download_file(file_info.file_path)
         file_bytes = downloaded.read()
@@ -2068,7 +2248,10 @@ async def handle_document(message: Message):
     except Exception as e:
         logging.error(f"Ошибка при обработке документа: {e}", exc_info=True)
         try:
-            await status_msg.edit_text("⚠️ Ошибка при чтении документа. Попробуй ещё раз.")
+            if status_msg is not None:
+                await status_msg.edit_text("⚠️ Ошибка при чтении документа. Попробуй ещё раз.")
+            else:
+                await message.answer("⚠️ Не удалось начать чтение документа. Попробуй ещё раз.")
         except Exception:
             pass
         doc_analysis_states.discard(user_id)
@@ -2169,6 +2352,7 @@ async def cb_answer_actions(callback: types.CallbackQuery):
         user_data["last_output"] = clean_msg
         user_data_stats = get_user_stats(user_id)
         user_data_stats["exports"] += 1
+        save_stats_db()
 
         doc = build_answer_only_word(clean_msg)
         bio = io.BytesIO(); doc.save(bio); raw = bio.getvalue(); bio.close()
@@ -2519,13 +2703,16 @@ async def handle_voice(message: Message):
         await message.answer("⏳ Подожди, предыдущая задача ещё выполняется...")
         return
 
-    save_user_id(user_id)
-    get_user_stats(user_id)["voice"] += 1
-    save_stats_db()
-    status_msg = await message.answer("🎙 Распознаю голосовое сообщение...")
-
+    # Захватываем пользователя до первого сетевого await: два быстрых сообщения
+    # не должны одновременно запустить две тяжёлые задачи.
     busy_users.add(user_id)
+    status_msg = None
     try:
+        save_user_id(user_id)
+        get_user_stats(user_id)["voice"] += 1
+        remember_action(user_id, "voice")
+        save_stats_db()
+        status_msg = await message.answer("🎙 Распознаю голосовое сообщение...")
         file_info = await bot.get_file(message.voice.file_id)
         downloaded = await bot.download_file(file_info.file_path)
         audio_bytes = downloaded.read()
@@ -2603,7 +2790,8 @@ async def handle_voice(message: Message):
 
         # Голос обрабатывается как обычный текстовый запрос, поэтому история,
         # режим ИИ и экспорт последнего ответа продолжают работать одинаково.
-        user_data["history"].append({"role": "user", "content": transcript})
+        voice_user_turn = {"role": "user", "content": transcript}
+        user_data["history"].append(voice_user_turn)
         if len(user_data["history"]) > 6:
             user_data["history"] = user_data["history"][-6:]
 
@@ -2631,7 +2819,7 @@ async def handle_voice(message: Message):
         except Exception:
             pass
 
-        parse_mode = "Markdown" if current_mode == "coder" else "HTML"
+        parse_mode = "HTML"
         await safe_answer(
             message,
             full_message,
@@ -2640,12 +2828,19 @@ async def handle_voice(message: Message):
         )
 
     except Exception as e:
+        if "user_data" in locals() and user_data.get("history") and user_data["history"][-1] is locals().get("voice_user_turn"):
+            user_data["history"].pop()
+            save_users_db()
         logging.error(f"Ошибка обработки голосового сообщения: {e}", exc_info=True)
         try:
-            await status_msg.edit_text(
+            error_text = (
                 "⚠️ Не удалось обработать голосовое сообщение. "
                 "Попробуй записать его ещё раз чуть короче и без сильного фонового шума."
             )
+            if status_msg is not None:
+                await status_msg.edit_text(error_text)
+            else:
+                await message.answer(error_text)
         except Exception:
             pass
     finally:
@@ -2660,8 +2855,12 @@ async def handle_photo(message: Message):
         return
     if not await _ingress_allowed(message, 8, 60, "изображения"): return
 
+    if user_id in busy_users:
+        await message.answer("⏳ Подожди, предыдущая задача ещё выполняется...")
+        return
     save_user_id(user_id)
     get_user_stats(user_id)["images"] += 1
+    remember_action(user_id, "image")
     save_stats_db()
     photo = message.photo[-1]
 
@@ -2678,28 +2877,30 @@ async def handle_photo(message: Message):
         return
 
     # Скачивание фото выполняем только когда оно действительно нужно Vision.
+    if photo.file_size and photo.file_size > 8 * 1024 * 1024:
+        await message.answer("⚠️ Фото слишком большое для анализа (лимит — 8 МБ). Пришли изображение меньшего размера.")
+        return
+    # Claim before download; the download itself can take long enough for another
+    # update from the same user to arrive.
+    busy_users.add(user_id)
     try:
-        if photo.file_size and photo.file_size > MAX_DOC_SIZE_BYTES:
-            await message.answer("⚠️ Фото слишком большое (лимит Telegram на скачивание — 20 МБ). Пришли файл меньшего размера.")
-            return
         file_info = await bot.get_file(photo.file_id)
         downloaded_file = await bot.download_file(file_info.file_path)
         img_bytes = downloaded_file.read()
+        if len(img_bytes) > 8 * 1024 * 1024:
+            raise ValueError("image exceeds 8 MB after download")
     except Exception as e:
+        busy_users.discard(user_id)
         logging.error(f"Не удалось скачать фото от пользователя {user_id}: {e}")
         await message.answer("⚠️ Не удалось загрузить фото. Проверь соединение и попробуй отправить ещё раз.")
-        return
-
-    if user_id in busy_users:
-        await message.answer("⏳ Подожди, предыдущая задача ещё выполняется...")
         return
 
     # Если пользователь в режиме анализа документа — считаем фото сканом страницы
     # и распознаём текст через vision-модель вместо обычного анализа изображения.
     if user_id in doc_analysis_states:
-        busy_users.add(user_id)
-        status_msg = await message.answer("📚 Распознаю текст на фото...")
+        status_msg = None
         try:
+            status_msg = await message.answer("📚 Распознаю текст на фото...")
             base64_image = base64.b64encode(img_bytes).decode('utf-8')
             response = await call_groq_with_retry(
                 model=VISION_MODEL,
@@ -2718,7 +2919,10 @@ async def handle_photo(message: Message):
         except Exception as e:
             logging.error(f"Ошибка распознавания текста с фото: {e}", exc_info=True)
             try:
-                await status_msg.edit_text("⚠️ Не удалось распознать текст на фото. Попробуй ещё раз.")
+                if status_msg is not None:
+                    await status_msg.edit_text("⚠️ Не удалось распознать текст на фото. Попробуй ещё раз.")
+                else:
+                    await message.answer("⚠️ Не удалось начать распознавание фото. Попробуй ещё раз.")
             except Exception:
                 pass
             doc_analysis_states.discard(user_id)
@@ -2727,9 +2931,8 @@ async def handle_photo(message: Message):
         return
 
     # Обычный режим анализа картинки через Vision ИИ
-    busy_users.add(user_id)
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
         # Base64 temporarily doubles memory; reject unexpectedly huge images early.
         if len(img_bytes) > 8 * 1024 * 1024:
             raise ValueError("image too large")
@@ -2849,6 +3052,8 @@ async def handle_text(message: Message):
         )
         return
     if not await _ingress_allowed(message, 15, 30, "сообщения"): return
+    remember_action(user_id, "text")
+    save_stats_db()
 
     # Сначала обслуживаем многошаговый титульник — отдельного catch-all handler больше нет.
     if await _handle_title_page_text(message):
@@ -3010,14 +3215,15 @@ async def handle_text(message: Message):
             f"У пользователя есть загруженный документ. Если вопрос относится к нему, отвечай по релевантным фрагментам ниже. Если данных нет — скажи это прямо, не выдумывай.\n---\n{doc_context}\n---"
         )
 
-    user_data["history"].append({"role": "user", "content": message.text})
+    user_turn = {"role": "user", "content": message.text}
+    user_data["history"].append(user_turn)
     if len(user_data["history"]) > 6:
         user_data["history"] = user_data["history"][-6:]
 
     messages_payload = [{"role": "system", "content": system_prompt}] + user_data["history"]
 
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
         response = await call_groq_with_retry(messages=messages_payload)
         ai_reply = clean_text_for_html(response.choices[0].message.content)
         if not ai_reply:
@@ -3029,11 +3235,14 @@ async def handle_text(message: Message):
 
         if current_mode == "coder":
             full_message = f"{ai_reply}\n\n{AD_FOOTER}"
-            await safe_answer(message, full_message, parse_mode="Markdown", reply_markup=get_answer_inline_keyboard())
+            await safe_answer(message, full_message, parse_mode="HTML", reply_markup=get_answer_inline_keyboard())
         else:
             full_message = f"{ai_reply}{AD_FOOTER}"
             await safe_answer(message, full_message, parse_mode="HTML", reply_markup=get_answer_inline_keyboard())
     except Exception as e:
+        if user_data.get("history") and user_data["history"][-1] is user_turn:
+            user_data["history"].pop()
+            save_users_db()
         logging.error(f"Ошибка обычного запроса пользователя {user_id}: {e}", exc_info=True)
         _track_user_event(user_id, message=message, kind="text", status="error", prompt=message.text or "", error=str(e))
         await message.answer("⚠️ Сейчас ИИ временно недоступен. Я сохранил ошибку в журнале и освободил задачу. Попробуй ещё раз через несколько секунд.")
@@ -3086,6 +3295,13 @@ def _ppt_normalize_item(raw, idx=0):
     def clean(v, limit=500):
         return re.sub(r'\s+', ' ', str(v or '')).strip()[:limit]
     points=[clean(x,360) for x in as_list(raw.get("points")) if clean(x,360)][:7]
+    if not points:
+        title_hint = clean(raw.get("title") or f"Слайд {idx+1}", 100)
+        points = [
+            f"Ключевой аспект: {title_hint}.",
+            "Рассмотри практический контекст и подтверждающие примеры.",
+            "Сформулируй вывод на основе проверяемых данных.",
+        ]
     stats=[]
     for st in as_list(raw.get("stats"))[:6]:
         if isinstance(st, dict):
@@ -3139,7 +3355,16 @@ async def generate_ai_image(session: aiohttp.ClientSession, prompt: str, width: 
             async with session.get(url, timeout=timeout) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"image HTTP {resp.status}")
-                data = await resp.read()
+                if resp.content_length and resp.content_length > 8 * 1024 * 1024:
+                    raise ValueError("изображение превышает лимит 8 МБ")
+                parts = []
+                total = 0
+                async for part in resp.content.iter_chunked(64 * 1024):
+                    total += len(part)
+                    if total > 8 * 1024 * 1024:
+                        raise ValueError("изображение превышает лимит 8 МБ")
+                    parts.append(part)
+                data = b"".join(parts)
                 if len(data) < 10_000:
                     raise ValueError("изображение подозрительно маленькое")
                 try:
@@ -3177,7 +3402,9 @@ def _ppt_overflow_check(slide):
 
 def _ppt_add_text(slide, text, x, y, w, h, size=18, bold=False, color=None, align=PP_ALIGN.LEFT):
     box = slide.shapes.add_textbox(PptxInches(x), PptxInches(y), PptxInches(w), PptxInches(h))
-    tf = box.text_frame; tf.word_wrap = True; tf.clear()
+    tf = box.text_frame; tf.word_wrap = True; tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE; tf.clear()
+    tf.margin_left = PptxInches(0.04); tf.margin_right = PptxInches(0.04)
+    tf.margin_top = PptxInches(0.02); tf.margin_bottom = PptxInches(0.02)
     p = tf.paragraphs[0]; p.text = str(text)[:900]; p.alignment = align
     _set_text_style(p, size, color or RGBColor(0x21,0x21,0x21), bold)
     return box
@@ -3196,10 +3423,51 @@ def _ppt_add_header(slide,theme,idx,title):
     _ppt_add_text(slide,title,1.28,.42,11.3,.72,27 if len(title)<60 else 21,True,theme["body_text"])
 
 
+MAX_PPT_IMAGE_PIXELS = 40_000_000
+
+
+def _ppt_add_image_contain(slide, img_stream, x, y, w, h):
+    """Insert a validated image without distorting its aspect ratio."""
+    if img_stream is None:
+        return None
+    try:
+        img_stream.seek(0)
+        try:
+            from PIL import Image
+            with Image.open(img_stream) as image_obj:
+                image_width, image_height = image_obj.size
+                if image_width <= 0 or image_height <= 0 or image_width * image_height > MAX_PPT_IMAGE_PIXELS:
+                    raise ValueError("image dimensions exceed the safe limit")
+                image_obj.verify()
+            scale = min(w / image_width, h / image_height)
+            fitted_w = image_width * scale
+            fitted_h = image_height * scale
+            left = x + (w - fitted_w) / 2
+            top = y + (h - fitted_h) / 2
+            img_stream.seek(0)
+            return slide.shapes.add_picture(
+                img_stream, left=PptxInches(left), top=PptxInches(top),
+                width=PptxInches(fitted_w), height=PptxInches(fitted_h)
+            )
+        except ImportError:
+            # Pillow is optional at runtime; python-pptx can still decode common formats.
+            img_stream.seek(0)
+            return slide.shapes.add_picture(
+                img_stream, left=PptxInches(x), top=PptxInches(y),
+                width=PptxInches(w), height=PptxInches(h)
+            )
+    except Exception as exc:
+        logging.warning("PPT image skipped: %s", exc)
+        return None
+    finally:
+        try:
+            img_stream.seek(0)
+        except Exception:
+            pass
+
+
 def _ppt_add_image(slide,img_stream,x=8.15,y=1.55,w=4.45,h=4.95):
-    if img_stream is None: return
-    try: slide.shapes.add_picture(img_stream,left=PptxInches(x),top=PptxInches(y),width=PptxInches(w),height=PptxInches(h))
-    except Exception as e: logging.warning("PPT image insert failed: %s",e)
+    return _ppt_add_image_contain(slide, img_stream, x, y, w, h)
 
 
 def _ppt_add_takeaway(slide, text, theme, y=6.18):
@@ -3217,6 +3485,7 @@ def _ppt_add_subtitle(slide, subtitle, theme):
         _ppt_add_text(slide, subtitle, .72, 1.16, 11.7, .4, 11, False, theme.get("muted_text", theme.get("subtitle_text", theme.get("body_text", "666666"))))
 
 def build_advanced_ppt_slide(prs, theme, idx, item, img_stream=None):
+    item = _ppt_normalize_item(item, idx)
     s = prs.slides.add_slide(prs.slide_layouts[6])
     s.background.fill.solid(); s.background.fill.fore_color.rgb = theme["bg"]
     layout = str(item.get("layout") or "bullets").lower()
@@ -3282,8 +3551,7 @@ def build_advanced_ppt_slide(prs, theme, idx, item, img_stream=None):
             yy+=h+0.12
         if has_img:
             frame=s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,PptxInches(8.15),PptxInches(1.55),PptxInches(4.5),PptxInches(4.95)); frame.fill.solid(); frame.fill.fore_color.rgb=RGBColor(0xEE,0xF1,0xF5); frame.line.color.rgb=RGBColor(0xD9,0xDE,0xE5)
-            try: s.shapes.add_picture(img_stream,left=PptxInches(8.28),top=PptxInches(1.68),width=PptxInches(4.24),height=PptxInches(4.69))
-            except Exception as e: logging.warning("PPT image insert failed: %s",e)
+            _ppt_add_image_contain(s, img_stream, 8.28, 1.68, 4.24, 4.69)
     _ppt_add_takeaway(s, item.get("takeaway"), theme)
     _ppt_add_source(s, item.get("source"), theme)
     _ppt_overflow_check(s)
@@ -3293,12 +3561,15 @@ def build_advanced_ppt_slide(prs, theme, idx, item, img_stream=None):
 
 async def _ppt_structure(topic, num_slides):
     response=await call_groq_with_retry(messages=[
-        {"role":"system","content":f"Создай визуально сильную, содержательную презентацию на русском языке ровно из {num_slides} содержательных слайдов после титульного. Это должна быть презентация уровня современного pitch deck / Canva: один главный тезис на слайд, сильная визуальная иерархия, мало текста, конкретные факты, примеры и выводы. Верни ТОЛЬКО JSON-массив. Каждый объект: title, subtitle, layout, points, image_prompt, stats, columns, steps, quote, author, labels, values, series, chart_title, takeaway, source, note. layout выбирай из bullets, stats, comparison, timeline, process, quote, chart, conclusion. Не используй chart без labels/values и не выдумывай числовые данные: если надёжных чисел нет, используй comparison/process/bullets. Структура должна логично рассказывать историю: контекст → проблема/вопрос → ключевые идеи → данные или пример → сравнение/процесс → риски/ограничения → практический смысл → итог. Не повторяй одни и те же тезисы. Для большинства смысловых слайдов дай короткий image_prompt для тематического визуала; для chart и чистых comparison/stats можно оставить пустым. points — 2–5 коротких, конкретных тезисов. takeaway — одна сильная фраза. source — только если источник реально известен из темы/контекста."},
+        {"role":"system","content":f"Создай визуально сильную, содержательную презентацию на русском языке ровно из {num_slides} содержательных слайдов после титульного. Это должна быть презентация уровня современного pitch deck / Canva: один главный тезис на слайд, сильная визуальная иерархия, мало текста, конкретные факты, примеры и выводы. Верни ТОЛЬКО JSON-массив. Каждый объект: title, subtitle, layout, points, image_prompt, stats, columns, steps, quote, author, labels, values, series, chart_title, takeaway, source, note. layout выбирай из bullets, stats, comparison, timeline, process, quote, chart, conclusion. Не используй chart без labels/values и не выдумывай числовые данные. Не выдумывай статистику, цитаты, названия исследований, URL и библиографические источники. Опирайся только на сведения, которые даны в теме/контексте; если точных данных нет, используй качественное объяснение и явно обозначай пример как условный. source заполняй только если конкретный источник прямо предоставлен пользователем. Структура должна логично рассказывать историю: контекст → проблема/вопрос → ключевые идеи → данные или пример → сравнение/процесс → риски/ограничения → практический смысл → итог. Не повторяй одни и те же тезисы. Для большинства смысловых слайдов дай короткий image_prompt для тематического визуала; для chart и чистых comparison/stats можно оставить пустым. points — 2–5 коротких, конкретных тезисов. takeaway — одна сильная фраза."},
         {"role":"user","content":f"Тема: {topic[:2500]}"}
     ],temperature=0.35,max_retries=2,timeout=50)
-    data=extract_json(clean_text_for_html(response.choices[0].message.content))
-    if not isinstance(data,list): raise ValueError("Некорректная структура PPT")
-    return data[:num_slides]
+    data = extract_json(response.choices[0].message.content)
+    if not isinstance(data, list):
+        raise ValueError("Некорректная структура PPT: ожидался JSON-массив")
+    if not data:
+        raise ValueError("Модель вернула пустую структуру презентации")
+    return [_ppt_normalize_item(item, idx) for idx, item in enumerate(data[:num_slides])]
 
 
 def _ppt_quality_audit(prs):
@@ -3309,6 +3580,11 @@ def _ppt_quality_audit(prs):
         if len(texts)<3:
             issues.append(f"slide {i}: too little content")
         for sh in slide.shapes:
+            if sh.left < 0 or sh.top < 0 or sh.left + sh.width > prs.slide_width or sh.top + sh.height > prs.slide_height:
+                issues.append(f"slide {i}: shape outside canvas")
+            if hasattr(sh, "text_frame") and sh.text_frame is not None:
+                sh.text_frame.word_wrap = True
+                sh.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
             if getattr(sh,'has_chart',False):
                 try:
                     chart=sh.chart
@@ -3323,18 +3599,23 @@ async def generate_presentation_file(message: Message, topic: str, user_id: int 
     user_id=user_id or message.from_user.id
     if user_id in busy_users:
         await message.answer("⏳ Подожди, предыдущая задача ещё выполняется..."); return
-    busy_users.add(user_id); heavy_lock=None; status_msg=await message.answer("📈 Анализирую содержание → подбираю макеты → проверяю визуалы…")
+    busy_users.add(user_id); heavy_lock=None; status_msg=None
     theme = PPT_THEMES.get("ppt_blue", next(iter(PPT_THEMES.values())))
+    total_slides = int(user_ppt_slide_count.get(user_id, 8) or 8)
+    if total_slides not in PPT_SLIDE_COUNTS:
+        total_slides = 8
     try:
+        status_msg = await message.answer("📈 Анализирую содержание → подбираю макеты → проверяю визуалы…")
         heavy_lock=await acquire_heavy_job(status_msg)
         theme_key=user_ppt_design.pop(user_id,"ppt_blue"); theme=PPT_THEMES.get(theme_key,PPT_THEMES["ppt_blue"])
         custom=user_ppt_images.pop(user_id,[])[:MAX_PPT_IMAGES]
         # Сохраняем выбранное пользователем количество содержательных слайдов.
-        n=int(user_ppt_slide_count.pop(user_id, 8) or 8)
-        if n not in PPT_SLIDE_COUNTS:
-            n=8
+        total_slides=int(user_ppt_slide_count.pop(user_id, total_slides) or total_slides)
+        if total_slides not in PPT_SLIDE_COUNTS:
+            total_slides=8
+        content_slides=max(1, total_slides - 1)
         try:
-            slides=await _ppt_structure(topic,n)
+            slides=await _ppt_structure(topic,content_slides)
         except Exception as structure_error:
             logging.error("PPT structure generation failed, using fallback: %s", structure_error, exc_info=True)
             fallback_titles = [
@@ -3344,11 +3625,11 @@ async def generate_presentation_file(message: Message, topic: str, user_id: int 
                 "Перспективы", "Заключение"
             ]
             slides=[]
-            for i in range(n):
+            for i in range(content_slides):
                 title=fallback_titles[i % len(fallback_titles)]
                 slides.append({
                     "title": title,
-                    "layout": "bullets" if i < n-1 else "conclusion",
+                    "layout": "bullets" if i < content_slides - 1 else "conclusion",
                     "points": [
                         f"Основной аспект: {title.lower()}",
                         "Факты и практический контекст по теме",
@@ -3356,8 +3637,9 @@ async def generate_presentation_file(message: Message, topic: str, user_id: int 
                     ],
                     "image_prompt": ""
                 })
-        while len(slides)<n:
-            slides.append({"title":"Выводы","layout":"conclusion","points":["Главный результат","Практическое значение","Следующий шаг"]})
+        slides = [_ppt_normalize_item(item, idx) for idx, item in enumerate(slides[:content_slides])]
+        while len(slides)<content_slides:
+            slides.append(_ppt_normalize_item({"title":"Выводы","layout":"conclusion","points":["Главный результат","Практическое значение","Следующий шаг"]}, len(slides)))
         prs=Presentation(); prs.slide_width=PptxInches(13.333); prs.slide_height=PptxInches(7.5); build_title_slide(prs,theme,topic)
         async with aiohttp.ClientSession() as session:
             for idx,item in enumerate(slides):
@@ -3386,11 +3668,29 @@ async def generate_presentation_file(message: Message, topic: str, user_id: int 
                         ],
                     }
                     build_advanced_ppt_slide(prs,theme,idx,fallback,None)
+        qa_issues = _ppt_quality_audit(prs)
+        if qa_issues:
+            logging.warning("PPT quality audit found %d issue(s): %s", len(qa_issues), "; ".join(qa_issues[:12]))
+        if len(prs.slides) != total_slides:
+            raise RuntimeError(f"Ошибка контроля количества слайдов: ожидалось {total_slides}, создано {len(prs.slides)}")
         bio=io.BytesIO(); prs.save(bio); data=bio.getvalue()
         if len(data)>MAX_ARTIFACT_BYTES: raise ValueError("PPT слишком большой")
         path=_artifact_path(user_id,"pptx",topic); _atomic_write_bytes(path, data); register_artifact(user_id,"pptx",path,{"topic":topic,"theme":theme_key,"slides":len(prs.slides)})
-        await status_msg.delete(); await message.answer_document(BufferedInputFile(data,filename=os.path.basename(path)),caption=f"📈 Готово: {len(prs.slides)} слайдов • {theme['label']}\n✏️ Можно сразу написать, что изменить.")
+        if status_msg is not None:
+            try: await status_msg.delete()
+            except Exception: pass
+        await message.answer_document(BufferedInputFile(data,filename=os.path.basename(path)),caption=f"📈 Готово: ровно {len(prs.slides)} слайдов • {theme['label']}\n✏️ Можно сразу написать, что изменить.")
         get_user_stats(user_id)["exports"]+=1
+        save_stats_db()
+    except HeavyJobRejected as e:
+        logging.warning("PPT generation rejected by resource guard: %s", e)
+        try:
+            if status_msg is not None:
+                await status_msg.edit_text(f"⏳ {html.escape(str(e))}")
+            else:
+                await message.answer(f"⏳ {html.escape(str(e))}")
+        except Exception:
+            pass
     except Exception as e:
         logging.error("PPT 2.0 error: %s", e, exc_info=True)
         # Последний резерв: даже если AI/визуалы/сложный макет сломались,
@@ -3400,22 +3700,41 @@ async def generate_presentation_file(message: Message, topic: str, user_id: int 
             fallback_prs.slide_width = PptxInches(13.333)
             fallback_prs.slide_height = PptxInches(7.5)
             build_title_slide(fallback_prs, PPT_THEMES.get("ppt_blue", theme), topic)
-            fallback_items = [
-                {"title": "Главное о теме", "points": [f"Тема: {topic[:180]}", "Ключевые понятия и контекст", "Основной смысл"], "layout": "bullets"},
-                {"title": "Ключевые аспекты", "points": ["Основные факты", "Важные тенденции", "Практическое значение"], "layout": "bullets"},
-                {"title": "Вывод", "points": ["Главный результат", "Что важно запомнить", "Практический следующий шаг"], "layout": "conclusion"},
+            fallback_headings = [
+                "Главное о теме", "Ключевые аспекты", "Контекст и понятия", "Примеры и применение",
+                "Проблемы и ограничения", "Практическое значение", "Рекомендации", "Выводы",
+                "Дополнительные аспекты", "Перспективы", "Итоговый анализ",
             ]
+            fallback_items = []
+            for idx in range(max(1, total_slides - 1)):
+                heading = fallback_headings[idx % len(fallback_headings)]
+                fallback_items.append({
+                    "title": heading,
+                    "points": [f"Тема: {topic[:150]}", f"Основной аспект: {heading.lower()}", "Проверь конкретные факты и детали по надёжным источникам."],
+                    "layout": "conclusion" if idx == total_slides - 2 else "bullets",
+                })
             for idx, item in enumerate(fallback_items):
                 build_advanced_ppt_slide(fallback_prs, PPT_THEMES.get("ppt_blue", theme), idx, item, None)
+            if len(fallback_prs.slides) != total_slides:
+                raise RuntimeError("Резервная презентация не прошла проверку количества слайдов")
             fb = io.BytesIO(); fallback_prs.save(fb); fb_data = fb.getvalue()
             fb_path = _artifact_path(user_id, "pptx", topic); _atomic_write_bytes(fb_path, fb_data)
             register_artifact(user_id, "pptx", fb_path, {"topic": topic, "fallback": True, "slides": len(fallback_prs.slides)})
-            await status_msg.edit_text("⚠️ Визуалы/сложный макет не загрузились, поэтому я собрал упрощённую версию презентации.")
+            if status_msg is not None:
+                try: await status_msg.edit_text("⚠️ Визуалы/сложный макет не загрузились, поэтому я собрал упрощённую версию презентации.")
+                except Exception: pass
+            else:
+                await message.answer("⚠️ Собрал упрощённую версию презентации.")
             await message.answer_document(BufferedInputFile(fb_data, filename=os.path.basename(fb_path)), caption="📈 Презентация готова в упрощённом режиме. Можно написать, что изменить.")
+            get_user_stats(user_id)["exports"] += 1
+            save_stats_db()
         except Exception as fallback_error:
             logging.error("PPT fallback also failed: %s", fallback_error, exc_info=True)
             try:
-                await status_msg.edit_text("⚠️ Не удалось создать даже резервную презентацию. Подробность сохранена в журнале ошибок.")
+                if status_msg is not None:
+                    await status_msg.edit_text("⚠️ Не удалось создать даже резервную презентацию. Подробность сохранена в журнале ошибок.")
+                else:
+                    await message.answer("⚠️ Не удалось создать резервную презентацию. Подробность сохранена в журнале ошибок.")
             except Exception:
                 pass
     finally:
@@ -3436,34 +3755,46 @@ def _excel_detect_format(header, values):
 async def generate_excel_file(message: Message, topic: str, user_id: int = None):
     user_id=user_id or message.from_user.id
     if user_id in busy_users: await message.answer("⏳ Подожди, предыдущая задача ещё выполняется..."); return
-    busy_users.add(user_id); heavy_lock=None; status=await message.answer("📊 Строю данные → формулы → KPI → Dashboard → диаграммы…")
+    busy_users.add(user_id); heavy_lock=None; status=None
     try:
+        status = await message.answer("📊 Строю данные → формулы → KPI → Dashboard → диаграммы…")
         heavy_lock=await acquire_heavy_job(status)
         response=await call_groq_with_retry(messages=[
-            {"role":"system","content":"Ты генератор Excel-данных. Верни ТОЛЬКО валидный JSON без Markdown и пояснений. Строго объект с ключами title, sheet_name, headers, rows, formulas. headers — массив из 2-12 строк. rows — массив массивов, 5-40 строк. formulas — массив объектов {cell,formula} или []. Не используй комментарии вне JSON."},
+            {"role":"system","content":"Ты генератор Excel-данных. Верни ТОЛЬКО валидный JSON без Markdown и пояснений. Строго объект с ключами title, sheet_name, headers, rows, formulas, data_note. headers — массив из 2-12 строк. rows — массив массивов, 5-40 строк. formulas — массив объектов {cell,formula} или []. data_note — коротко укажи происхождение данных: если пользователь не предоставил фактические данные и таблица содержит придуманный демонстрационный набор, прямо отметь это; не выдавай вымышленные числа за реальную статистику. Не придумывай источники. Не используй комментарии вне JSON."},
             {"role":"user","content":topic[:4000]}],temperature=0.1)
         raw_ai = response.choices[0].message.content
         try:
-            data=extract_json(clean_text_for_html(raw_ai))
+            data=extract_json(raw_ai)
         except Exception:
             # Второй, более короткий запрос часто спасает модели, которые добавили пояснение
             # к JSON в первом ответе.
             retry=await call_groq_with_retry(messages=[
-                {"role":"system","content":'Верни только JSON. Формат: {"title":"...","sheet_name":"Данные","headers":["Столбец 1","Столбец 2"],"rows":[["значение 1","значение 2"]],"formulas":[]}. Никаких ``` и текста вокруг JSON.'},
+                {"role":"system","content":'Верни только JSON. Формат: {"title":"...","sheet_name":"Данные","headers":["Столбец 1","Столбец 2"],"rows":[["значение 1","значение 2"]],"formulas":[],"data_note":"Укажи, являются ли данные демонстрационными или предоставлены пользователем."}. Никаких ``` и текста вокруг JSON.'},
                 {"role":"user","content":topic[:3000]}],temperature=0)
             data=extract_json(retry.choices[0].message.content)
         if not isinstance(data, dict):
             raise ValueError("AI вернул не объект JSON")
-        headers=[str(x).strip() for x in data.get('headers',[]) if str(x).strip()][:12]
+        headers=[str(safe_excel_value(str(x).strip())) for x in data.get('headers',[]) if str(x).strip()][:12]
         if not headers: raise ValueError('Нет заголовков')
         rows=[]
         for row in (data.get('rows') or [])[:40]:
-            r=list(row) if isinstance(row,(list,tuple)) else [row]; rows.append((r+[""]*len(headers))[:len(headers)])
-        wb=Workbook(); ws=wb.active; ws.title=re.sub(r'[\\/*?:\[\]]','_',str(data.get('sheet_name') or 'Данные'))[:31] or 'Данные'
-        ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(headers)); c=ws.cell(1,1,str(data.get('title') or topic)[:120]); c.font=Font(name='Aptos Display',size=18,bold=True,color='FFFFFF'); c.fill=PatternFill('solid',fgColor='1F4E78'); ws.row_dimensions[1].height=30
+            r=list(row) if isinstance(row,(list,tuple)) else [row]
+            safe_row = []
+            for value in r:
+                if isinstance(value, (dict, list, tuple)):
+                    value = json.dumps(value, ensure_ascii=False)[:500]
+                if isinstance(value, str):
+                    value = safe_excel_value(value[:2000])
+                elif not isinstance(value, (int, float, bool, type(None))):
+                    value = str(value)[:2000]
+                safe_row.append(value)
+            rows.append((safe_row+[""]*len(headers))[:len(headers)])
+        wb=Workbook(); ws=wb.active; ws.title=re.sub(r'[\\/*?:\[\]\']','_',str(data.get('sheet_name') or 'Данные'))[:31] or 'Данные'
+        ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=len(headers)); c=ws.cell(1,1,safe_excel_value(str(data.get('title') or topic)[:120])); c.font=Font(name='Aptos Display',size=18,bold=True,color='FFFFFF'); c.fill=PatternFill('solid',fgColor='1F4E78'); ws.row_dimensions[1].height=30
         ws.append(headers)
         for cell in ws[2]: cell.font=Font(bold=True,color='FFFFFF'); cell.fill=PatternFill('solid',fgColor='2F75B5'); cell.alignment=Alignment(horizontal='center',wrap_text=True)
         for r in rows: ws.append(r)
+        data_last_row = ws.max_row
         for ci,h in enumerate(headers,1):
             vals=[ws.cell(r,ci).value for r in range(3,ws.max_row+1)]
             fmt=_excel_detect_format(h,vals)
@@ -3479,36 +3810,78 @@ async def generate_excel_file(message: Message, topic: str, user_id: int = None)
             if vals and sum(isinstance(v,(int,float)) for v in vals)/len(vals)>=0.7:
                 rng=f'{get_column_letter(ci)}3:{get_column_letter(ci)}{ws.max_row}'
                 ws.conditional_formatting.add(rng,ColorScaleRule(start_type='min',start_color='F2F2F2',mid_type='percentile',mid_value=50,mid_color='D9EAF7',end_type='max',end_color='5B9BD5'))
-        for f in data.get('formulas') or []:
-            try: ws[str(f['cell'])]=str(f['formula'])
-            except Exception: pass
+        accepted_formulas = 0
+        for formula_item in data.get('formulas') or []:
+            try:
+                if not isinstance(formula_item, dict):
+                    continue
+                cell_ref = str(formula_item.get('cell') or '').strip().upper()
+                formula = safe_excel_formula(formula_item.get('formula'))
+                cell_match = re.fullmatch(r"([A-Z]{1,3})([1-9][0-9]{0,5})", cell_ref)
+                if not formula or not cell_match:
+                    continue
+                col_num = 0
+                for char in cell_match.group(1):
+                    col_num = col_num * 26 + ord(char) - 64
+                row_num = int(cell_match.group(2))
+                if col_num > len(headers) or row_num < 3 or row_num > data_last_row:
+                    continue
+                ws[cell_ref] = formula
+                accepted_formulas += 1
+            except Exception as formula_error:
+                logging.warning("Skipping unsafe or malformed spreadsheet formula: %s", formula_error)
+        if data.get('formulas') and not accepted_formulas:
+            logging.info("Excel generator returned no formulas accepted by the local safety policy")
+        data_note = str(data.get("data_note") or "").strip()[:500]
+        if data_note:
+            note_row = data_last_row + 2
+            ws.cell(note_row, 1, "Примечание").font = Font(bold=True, color="1F4E78")
+            note_cell = ws.cell(note_row, 2, safe_excel_value(data_note))
+            note_cell.alignment = Alignment(wrap_text=True, vertical="top")
+            note_cell.font = Font(italic=True, color="666666")
+            if len(headers) > 2:
+                ws.merge_cells(start_row=note_row, start_column=2, end_row=note_row, end_column=len(headers))
+            ws.row_dimensions[note_row].height = 36
         # Dashboard with multiple chart types and KPI formulas.
         numeric=[]
         for ci in range(2,len(headers)+1):
-            vals=[ws.cell(r,ci).value for r in range(3,ws.max_row+1)]
+            vals=[ws.cell(r,ci).value for r in range(3,data_last_row+1)]
             if vals and sum(isinstance(v,(int,float)) for v in vals)/len(vals)>=0.7: numeric.append(ci)
-        dash=wb.create_sheet('Dashboard'); dash['A1']=str(data.get('title') or topic)[:100]; dash['A1'].font=Font(size=20,bold=True)
+        dash=wb.create_sheet('Dashboard'); dash['A1']=safe_excel_value(str(data.get('title') or topic)[:100]); dash['A1'].font=Font(size=20,bold=True)
         for i,ci in enumerate(numeric[:4]):
             col=get_column_letter(ci); x=1+(i%2)*3; y=3+(i//2)*4
-            dash.cell(y,x,'Итого').font=Font(bold=True); dash.cell(y,x+1,f'=SUM(\'{ws.title}\'!{col}3:{col}{ws.max_row})')
-            dash.cell(y+1,x,'Среднее').font=Font(bold=True); dash.cell(y+1,x+1,f'=AVERAGE(\'{ws.title}\'!{col}3:{col}{ws.max_row})')
+            dash.cell(y,x,'Итого').font=Font(bold=True); dash.cell(y,x+1,f'=SUM(\'{ws.title}\'!{col}3:{col}{data_last_row})')
+            dash.cell(y+1,x,'Среднее').font=Font(bold=True); dash.cell(y+1,x+1,f'=AVERAGE(\'{ws.title}\'!{col}3:{col}{data_last_row})')
         if numeric:
-            chart=BarChart(); chart.type='col'; chart.style=10; chart.title=f'{headers[numeric[0]-1]} по {headers[0]}'; chart.add_data(Reference(ws,min_col=numeric[0],max_col=numeric[0],min_row=2,max_row=ws.max_row),titles_from_data=True); chart.set_categories(Reference(ws,min_col=1,min_row=3,max_row=ws.max_row)); chart.width=18; chart.height=9; dash.add_chart(chart,'A12')
+            chart=BarChart(); chart.type='col'; chart.style=10; chart.title=f'{headers[numeric[0]-1]} по {headers[0]}'; chart.add_data(Reference(ws,min_col=numeric[0],max_col=numeric[0],min_row=2,max_row=data_last_row),titles_from_data=True); chart.set_categories(Reference(ws,min_col=1,min_row=3,max_row=data_last_row)); chart.width=18; chart.height=9; dash.add_chart(chart,'A12')
         if len(numeric)>1:
             from openpyxl.chart import LineChart
-            line=LineChart(); line.title=f'Динамика: {headers[numeric[1]-1]}'; line.add_data(Reference(ws,min_col=numeric[1],max_col=numeric[1],min_row=2,max_row=ws.max_row),titles_from_data=True); line.set_categories(Reference(ws,min_col=1,min_row=3,max_row=ws.max_row)); line.width=18; line.height=9; dash.add_chart(line,'J12')
+            line=LineChart(); line.title=f'Динамика: {headers[numeric[1]-1]}'; line.add_data(Reference(ws,min_col=numeric[1],max_col=numeric[1],min_row=2,max_row=data_last_row),titles_from_data=True); line.set_categories(Reference(ws,min_col=1,min_row=3,max_row=data_last_row)); line.width=18; line.height=9; dash.add_chart(line,'J12')
         bio=io.BytesIO(); wb.save(bio); raw=bio.getvalue();
         if not raw or len(raw) > MAX_ARTIFACT_BYTES: raise ValueError('Excel слишком большой или пустой')
         path=_artifact_path(user_id,'xlsx',topic); _atomic_write_bytes(path, raw); register_artifact(user_id,'xlsx',path,{'topic':topic,'sheet':ws.title})
-        await status.delete(); await message.answer_document(BufferedInputFile(raw,filename=os.path.basename(path)),caption=f'📊 Excel готов: {len(rows)} строк, {len(headers)} столбцов.\n✏️ Можно написать, что изменить.')
+        if status is not None:
+            try: await status.delete()
+            except Exception: pass
+        await message.answer_document(BufferedInputFile(raw,filename=os.path.basename(path)),caption=f'📊 Excel готов: {len(rows)} строк, {len(headers)} столбцов.\n✏️ Можно написать, что изменить.')
         get_user_stats(user_id)['exports']+=1
+        save_stats_db()
+    except HeavyJobRejected as e:
+        logging.warning("Excel generation rejected by resource guard: %s", e)
+        try:
+            if status is not None:
+                await status.edit_text(f"⏳ {html.escape(str(e))}")
+            else:
+                await message.answer(f"⏳ {html.escape(str(e))}")
+        except Exception:
+            pass
     except Exception as e:
         logging.error('Excel 2.0 error: %s', e, exc_info=True)
         # Резервный режим: создаём валидный XLSX даже при сбое AI/JSON.
         try:
             wb = Workbook(); ws = wb.active; ws.title = 'Данные'
             ws.append(['Параметр', 'Значение'])
-            ws.append(['Запрос', topic[:300]])
+            ws.append(['Запрос', safe_excel_value(topic[:300])])
             ws.append(['Статус', 'Создано в резервном режиме'])
             ws.append(['Дата', datetime.now().strftime('%Y-%m-%d')])
             ws.append(['Комментарий', 'AI не вернул корректную структуру; файл всё равно создан.'])
@@ -3519,11 +3892,21 @@ async def generate_excel_file(message: Message, topic: str, user_id: int = None)
             bio = io.BytesIO(); wb.save(bio); raw = bio.getvalue()
             fb_path = _artifact_path(user_id, 'xlsx', topic); _atomic_write_bytes(fb_path, raw)
             register_artifact(user_id, 'xlsx', fb_path, {'topic': topic, 'fallback': True})
-            await status.edit_text('⚠️ AI не смог разложить запрос по столбцам, поэтому я создал резервный Excel. Его можно попросить дополнить.')
+            if status is not None:
+                try: await status.edit_text('⚠️ AI не смог разложить запрос по столбцам, поэтому я создал резервный Excel. Его можно попросить дополнить.')
+                except Exception: pass
+            else:
+                await message.answer('⚠️ Создал резервный Excel-файл.')
             await message.answer_document(BufferedInputFile(raw, filename=os.path.basename(fb_path)), caption='📊 Excel готов в резервном режиме. Напиши, какие столбцы/данные добавить.')
+            get_user_stats(user_id)['exports'] += 1
+            save_stats_db()
         except Exception as fallback_error:
             logging.error('Excel fallback also failed: %s', fallback_error, exc_info=True)
-            try: await status.edit_text('⚠️ Не удалось создать Excel-файл. Подробность сохранена в журнале ошибок.')
+            try:
+                if status is not None:
+                    await status.edit_text('⚠️ Не удалось создать Excel-файл. Подробность сохранена в журнале ошибок.')
+                else:
+                    await message.answer('⚠️ Не удалось создать Excel-файл. Подробность сохранена в журнале ошибок.')
             except Exception: pass
     finally:
         busy_users.discard(user_id); excel_states.discard(user_id); user_excel_topic.pop(user_id,None); user_excel_mode.pop(user_id,None)
@@ -3531,14 +3914,20 @@ async def generate_excel_file(message: Message, topic: str, user_id: int = None)
         gc.collect()
 
 def _artifact_text(path, limit=14000):
+    if not path_is_within(path, ARTIFACT_DIR) or not os.path.isfile(path):
+        return ""
     ext=os.path.splitext(path)[1].lower()
     if ext=='.xlsx':
         wb=__import__('openpyxl').load_workbook(path,read_only=True,data_only=False)
         out=[]
-        for ws in wb.worksheets[:3]:
-            out.append(f'Лист: {ws.title}')
-            for row in ws.iter_rows(min_row=1,max_row=25,values_only=True): out.append(' | '.join(str(v or '') for v in row))
-        return '\n'.join(out)[:limit]
+        try:
+            for ws in wb.worksheets[:3]:
+                out.append(f'Лист: {ws.title}')
+                for row in ws.iter_rows(min_row=1,max_row=25,values_only=True):
+                    out.append(' | '.join(str(v or '') for v in row))
+            return '\n'.join(out)[:limit]
+        finally:
+            wb.close()
     if ext=='.docx':
         d=Document(path); return '\n'.join(p.text for p in d.paragraphs)[:limit]
     if ext=='.pptx':
@@ -3550,8 +3939,9 @@ def _artifact_text(path, limit=14000):
     return ''
 
 async def _send_artifact(message,user_id,path,caption='Обновлённый файл'):
-    with open(path,'rb') as f: raw=f.read()
-    await message.answer_document(BufferedInputFile(raw,filename=os.path.basename(path)),caption=caption)
+    if not path_is_within(path, ARTIFACT_DIR) or not os.path.isfile(path):
+        raise FileNotFoundError("Артефакт отсутствует или находится вне хранилища")
+    await message.answer_document(FSInputFile(path, filename=os.path.basename(path)), caption=caption)
 
 def _edit_ppt_local(path,instruction):
     prs=Presentation(path); low=instruction.lower()
@@ -3646,15 +4036,33 @@ async def handle_artifact_command(message, normalized):
                 p=d.add_paragraph(line); p.style='Normal'
             d.save(path); register_artifact(user_id,'docx',path,{'source':art['path']}); await _send_artifact(message,user_id,path,'📄 Word создан из последнего файла.'); return True
     if not art['path'] or not os.path.exists(art['path']): return False
+    working_path = None
     try:
-        if art['kind']=='pptx': _edit_ppt_local(art['path'],normalized)
-        elif art['kind']=='xlsx': await _edit_excel_local(art['path'],normalized)
-        elif art['kind']=='docx': await _edit_word_local(art['path'],normalized)
-        else: return False
-        art['created']=time.time(); _save_artifacts(); await _send_artifact(message,user_id,art['path'],'✏️ Готово — изменил уже созданный файл, не начиная всё с нуля.')
+        source_path = os.path.abspath(art['path'])
+        if not path_is_within(source_path, ARTIFACT_DIR) or not os.path.isfile(source_path):
+            return False
+        ext = os.path.splitext(source_path)[1].lower()
+        kind_to_ext = {"pptx": ".pptx", "xlsx": ".xlsx", "docx": ".docx"}
+        if kind_to_ext.get(art.get('kind')) != ext:
+            raise ValueError("Формат файла не соответствует его типу")
+        working_path = _artifact_path(user_id, ext.lstrip('.'), f"edited_{os.path.basename(source_path)}")
+        shutil.copy2(source_path, working_path)
+        if art['kind']=='pptx': _edit_ppt_local(working_path,normalized)
+        elif art['kind']=='xlsx': await _edit_excel_local(working_path,normalized)
+        elif art['kind']=='docx': await _edit_word_local(working_path,normalized)
+        else:
+            os.remove(working_path)
+            return False
+        new_entry = register_artifact(user_id, art['kind'], working_path, {**(art.get('meta') or {}), "edited_from": source_path})
+        if not new_entry:
+            raise RuntimeError("Не удалось сохранить новую версию файла")
+        await _send_artifact(message,user_id,working_path,'✏️ Готово — создал новую версию. Исходный файл сохранён.')
         return True
     except Exception as e:
-        logging.error('Artifact edit failed: %s',e,exc_info=True); await message.answer('⚠️ Не удалось безопасно изменить файл. Исходный файл сохранён, попробуй описать изменение конкретнее.'); return True
+        if working_path and os.path.exists(working_path):
+            try: os.remove(working_path)
+            except OSError: pass
+        logging.error('Artifact edit failed: %s',e,exc_info=True); await message.answer('⚠️ Не удалось безопасно изменить файл. Исходная версия сохранена, попробуй описать изменение конкретнее.'); return True
 
 def _install_asyncio_exception_handler():
     """Логирует исключения фоновых asyncio-задач, которые иначе легко потерять."""
@@ -3923,8 +4331,10 @@ async def admin_callback(call: CallbackQuery):
         rows.sort(key=lambda x: x[0], reverse=True)
         lines = []
         for ts, uid, e in rows[:25]:
-            prompt = html.escape((e.get("prompt") or "—")[:160])
-            lines.append(f"{'✅' if e.get('status') == 'ok' else '⚠️'} <b>{html.escape(ts)}</b> · <code>{uid}</code> · {html.escape(e.get('kind','request'))}\n💬 {prompt}")
+            detail = e.get("prompt") or e.get("artifact") or e.get("error") or "содержание запроса не сохраняется"
+            detail = html.escape(str(detail)[:160])
+            status_mark = "✅" if e.get("status") in {"ok", "success", "completed", "received"} else "⚠️"
+            lines.append(f"{status_mark} <b>{html.escape(str(ts))}</b> · <code>{uid}</code> · {html.escape(str(e.get('kind','request')))}\nℹ️ {detail}")
         body = "\n\n".join(lines) or "История действий пока пуста."
         await call.message.edit_text("📋 <b>ИСТОРИЯ ПОЛЬЗОВАТЕЛЕЙ</b>\n\n" + body, parse_mode="HTML", reply_markup=_admin_back_keyboard())
     elif action == "admins":
@@ -3957,6 +4367,8 @@ USER_PROFILE_CACHE = {}
 USER_ACTIVITY_INDEX = {}
 USER_ACTIVITY_FILE = _data_file("user_activity.json")
 activity_dirty = False
+MAX_ACTIVITY_EVENTS_PER_USER = read_env_int("MECAUAI_MAX_ACTIVITY_EVENTS", 200, 20, 500)
+STORE_USER_PROMPTS = os.getenv("MECAUAI_STORE_PROMPTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 def _load_user_activity():
     global USER_REQUEST_HISTORY, USER_PROFILE_CACHE, USER_ACTIVITY_INDEX
@@ -3979,7 +4391,11 @@ def _load_user_activity():
         profile = item.get("profile")
         USER_PROFILE_CACHE[uid] = profile if isinstance(profile, dict) else {}
         rows = item.get("history") or []
-        USER_REQUEST_HISTORY[uid] = rows[-500:] if isinstance(rows, list) else []
+        clean_rows = rows[-MAX_ACTIVITY_EVENTS_PER_USER:] if isinstance(rows, list) else []
+        for event in clean_rows:
+            if isinstance(event, dict) and not STORE_USER_PROMPTS:
+                event.pop("prompt", None)
+        USER_REQUEST_HISTORY[uid] = [event for event in clean_rows if isinstance(event, dict)]
         if USER_REQUEST_HISTORY[uid]:
             USER_ACTIVITY_INDEX[uid] = USER_REQUEST_HISTORY[uid][-1].get("ts", "—")
 
@@ -3993,7 +4409,7 @@ def _save_user_activity(immediate=False):
     for uid in all_ids:
         data[str(uid)] = {
             "profile": USER_PROFILE_CACHE.get(uid, {}),
-            "history": USER_REQUEST_HISTORY.get(uid, [])[-500:]
+            "history": USER_REQUEST_HISTORY.get(uid, [])[-MAX_ACTIVITY_EVENTS_PER_USER:]
         }
     try:
         _atomic_json_write(USER_ACTIVITY_FILE, data)
@@ -4071,14 +4487,14 @@ def _track_user_event(user_id: int, message=None, kind="request", status="ok",
             "ts": datetime.now().isoformat(timespec="seconds"),
             "kind": kind,
             "status": status,
-            "prompt": (prompt or "")[:1500],
+            "prompt": (prompt or "")[:1500] if STORE_USER_PROMPTS else "",
             "artifact": (artifact or "")[:300],
             "error": (error or "")[:500],
         }
         history.append(event)
         # Hard cap per user to protect disk/RAM.
-        if len(history) > 500:
-            del history[:-500]
+        if len(history) > MAX_ACTIVITY_EVENTS_PER_USER:
+            del history[:-MAX_ACTIVITY_EVENTS_PER_USER]
         USER_ACTIVITY_INDEX[user_id] = event["ts"]
         global activity_dirty
         activity_dirty = True
@@ -4089,8 +4505,8 @@ def _user_profile_text(uid: int) -> str:
     p = USER_PROFILE_CACHE.get(uid, {})
     history = USER_REQUEST_HISTORY.get(uid, [])
     total = len(history)
-    ok = sum(1 for x in history if x.get("status") == "ok")
-    errors = total - ok
+    ok = sum(1 for x in history if x.get("status") in {"ok", "success", "completed", "received"})
+    errors = sum(1 for x in history if x.get("status") == "error")
     by_kind = {}
     for x in history:
         by_kind[x.get("kind", "request")] = by_kind.get(x.get("kind", "request"), 0) + 1
@@ -4209,37 +4625,79 @@ async def admin_user_profile_callback(call: CallbackQuery):
             pass
 
 
+BOT_READY = False
+
+async def _health_handler(request):
+    """Public liveness endpoint; contains no user data or infrastructure details."""
+    return web.json_response({"status": "ok", "service": "MecauAI"})
+
+
+async def _ready_handler(request):
+    status = 200 if BOT_READY else 503
+    return web.json_response({"status": "ready" if BOT_READY else "starting"}, status=status)
+
+
+async def _start_health_server():
+    """Expose /healthz on PORT so PaaS providers can keep polling workers alive."""
+    port_raw = os.getenv("PORT", "8080")
+    try:
+        port = int(port_raw)
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        raise RuntimeError(f"Некорректное значение PORT: {port_raw!r}")
+    app = web.Application(client_max_size=1024)
+    app.router.add_get("/", _health_handler)
+    app.router.add_get("/healthz", _health_handler)
+    app.router.add_get("/readyz", _ready_handler)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logging.info("Health endpoint listening on 0.0.0.0:%s/healthz", port)
+    return runner
+
+
+PROCESS_STARTED_AT = time.monotonic()
+
+
 async def main():
+    global BOT_READY
     _install_asyncio_exception_handler()
     cleanup_stale_tmp_files()
     cleanup_artifacts()
     _cleanup_orphan_artifact_files()
     logging.info("Legal PDFs: agreement=%s (%s), privacy=%s (%s)", os.path.isfile(AGREEMENT_FILE), AGREEMENT_FILE, os.path.isfile(PRIVACY_FILE), PRIVACY_FILE)
-    await _refresh_available_models()
-    logging.info("Groq models: text=%s fallbacks=%s vision=%s fallbacks=%s", TEXT_MODEL, TEXT_MODEL_FALLBACKS, VISION_MODEL, VISION_MODEL_FALLBACKS)
-    logging.info("Persistent users: %s (%d users)", USERS_FILE, len(_all_known_user_ids()))
-    logging.info("Persistent user history: %s (%d users)", USER_ACTIVITY_FILE, len(USER_REQUEST_HISTORY))
-    logging.info(
-        "Startup: DATA_DIR=%s ARTIFACT_DIR=%s RAM=%.1fMB LIMIT=%sMB SOFT=%sMB HARD=%sMB "
-        "DISK_FREE=%sMB AI_CONCURRENCY=%s HEAVY_CONCURRENCY=%s",
-        DATA_DIR, ARTIFACT_DIR, _memory_mb(),
-        round(_CONTAINER_RAM_MB) if _CONTAINER_RAM_MB else "unknown",
-        RAM_SOFT_LIMIT_MB, RAM_HARD_LIMIT_MB,
-        round(_disk_free_mb()) if _disk_free_mb() is not None else "unknown",
-        MAX_AI_CONCURRENCY, MAX_HEAVY_CONCURRENCY
-    )
-    await _startup_telegram_call("set_my_commands", lambda: bot.set_my_commands([
-        BotCommand(command="start", description="Перезапустить бота"),
-        BotCommand(command="mode",  description="Сменить режим ассистента"),
-        BotCommand(command="about", description="О возможностях"),
-        BotCommand(command="checksub", description="Проверить подписку пользователя (админ)"),
-    ]))
-    await _startup_telegram_call("delete_webhook", bot.delete_webhook)
-    maintenance = asyncio.create_task(maintenance_loop())
-    print("🚀 Бот MecauAI 2.0 запущен: оптимизированные ресурсы, очередь, watchdog, артефакты и редактор активны...")
+
+    # Start liveness early; readiness remains 503 until all startup checks finish.
+    health_runner = await _start_health_server()
+    maintenance = asyncio.create_task(maintenance_loop(), name="mecauai-maintenance")
     try:
-        await dp.start_polling(bot)
+        await _refresh_available_models()
+        logging.info("Groq models: text=%s fallbacks=%s vision=%s fallbacks=%s", TEXT_MODEL, TEXT_MODEL_FALLBACKS, VISION_MODEL, VISION_MODEL_FALLBACKS)
+        logging.info("Persistent users: %s (%d users)", USERS_FILE, len(_all_known_user_ids()))
+        logging.info("Persistent user history: %s (%d users)", USER_ACTIVITY_FILE, len(USER_REQUEST_HISTORY))
+        logging.info(
+            "Startup: DATA_DIR=%s ARTIFACT_DIR=%s RAM=%.1fMB LIMIT=%sMB SOFT=%sMB HARD=%sMB "
+            "DISK_FREE=%sMB AI_CONCURRENCY=%s HEAVY_CONCURRENCY=%s",
+            DATA_DIR, ARTIFACT_DIR, _memory_mb(),
+            round(_CONTAINER_RAM_MB) if _CONTAINER_RAM_MB else "unknown",
+            RAM_SOFT_LIMIT_MB, RAM_HARD_LIMIT_MB,
+            round(_disk_free_mb()) if _disk_free_mb() is not None else "unknown",
+            MAX_AI_CONCURRENCY, MAX_HEAVY_CONCURRENCY
+        )
+        await _startup_telegram_call("set_my_commands", lambda: bot.set_my_commands([
+            BotCommand(command="start", description="Перезапустить бота"),
+            BotCommand(command="mode",  description="Сменить режим ассистента"),
+            BotCommand(command="about", description="О возможностях"),
+            BotCommand(command="checksub", description="Проверить подписку пользователя (админ)"),
+        ]))
+        await _startup_telegram_call("delete_webhook", bot.delete_webhook)
+        BOT_READY = True
+        print("🚀 MecauAI запущен: health-check, watchdog, очередь задач, сохранение данных и редактор активны.")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        BOT_READY = False
         flush_persistent_state(force=True)
         maintenance.cancel()
         try:
@@ -4248,6 +4706,14 @@ async def main():
             pass
         except Exception:
             logging.exception("Maintenance shutdown error")
+        try:
+            await health_runner.cleanup()
+        except Exception:
+            logging.exception("Health server shutdown error")
+        try:
+            await groq_client.close()
+        except Exception:
+            logging.exception("Groq client shutdown error")
         try:
             await bot.session.close()
         except Exception:
