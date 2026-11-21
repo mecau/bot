@@ -70,9 +70,9 @@ from config import (
 
 # Fail early with an actionable message instead of a cryptic SDK traceback.
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN. Добавьте токен Telegram-бота в переменные окружения.")
+    raise RuntimeError("8943335529:AAHosLofc5TjQSIS3Oi8D50cVh8Hht7lH0I")
 if not GROQ_API_KEY:
-    raise RuntimeError("Не задан GROQ_API_KEY. Добавьте API-ключ Groq в переменные окружения.")
+    raise RuntimeError("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")
 
 # Groq model resilience:
 # the configured model can be unavailable for a particular project/key even when
